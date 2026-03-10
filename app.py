@@ -8,6 +8,8 @@ import os, json, time, re
 import streamlit as st
 from groq import Groq
 import PyPDF2
+from docx import Document as DocxDocument
+import pandas as pd
 from docx import Document
 from docx.shared import Pt, RGBColor, Inches
 from docx.enum.text import WD_ALIGN_PARAGRAPH
@@ -96,15 +98,60 @@ def safe_ai_call(messages, expect_json=False, max_tokens=1200):
         else "[Rate limit reached. Please wait 60 seconds and retry.]"
     )
 
-# ─── PDF EXTRACTION ───────────────────────────────────────────────────────────
-def extract_pdf(pdf_file):
-    try:
-        reader = PyPDF2.PdfReader(pdf_file)
-        pages  = [p.extract_text() for p in reader.pages
-                  if p.extract_text() and p.extract_text().strip()]
-        return "\n\n".join(pages)[:14000]
-    except Exception:
-        return ""
+# ─── DOCUMENT EXTRACTION ──────────────────────────────────────────────────────
+@st.cache_data(show_spinner=False)
+def extract_single_file(file_obj) -> str:
+    """Extract text from a single uploaded file based on its extension."""
+    ext = file_obj.name.lower().split('.')[-1]
+    
+    if ext == 'pdf':
+        try:
+            reader = PyPDF2.PdfReader(file_obj)
+            pages  = [p.extract_text() for p in reader.pages if p.extract_text() and p.extract_text().strip()]
+            return "\n\n".join(pages)
+        except Exception:
+            return ""
+            
+    elif ext == 'docx':
+        try:
+            doc = DocxDocument(file_obj)
+            paragraphs = [p.text for p in doc.paragraphs if p.text.strip()]
+            tables_text = []
+            for table in doc.tables:
+                for row in table.rows:
+                    tables_text.append(" | ".join([cell.text.strip() for cell in row.cells if cell.text.strip()]))
+            return "\n\n".join(paragraphs + tables_text)
+        except Exception:
+            return ""
+            
+    elif ext in ['xlsx', 'xls']:
+        try:
+            # Read all sheets; returns a dict of DataFrames
+            dfs = pd.read_excel(file_obj, sheet_name=None)
+            sheet_texts = []
+            for sheet_name, df in dfs.items():
+                sheet_texts.append(f"--- Sheet: {sheet_name} ---")
+                # Convert first 100 rows to CSV format string for LLM context
+                sheet_texts.append(df.head(100).to_csv(index=False))
+            return "\n\n".join(sheet_texts)
+        except Exception:
+            return ""
+            
+    return ""
+
+def extract_documents(uploaded_files) -> str:
+    """Process a list of uploaded files and combine their text."""
+    if not isinstance(uploaded_files, list):
+        uploaded_files = [uploaded_files]
+        
+    combined_text = []
+    for f in uploaded_files:
+        combined_text.append(f"\n\n========== DOCUMENT: {f.name} ==========\n")
+        text = extract_single_file(f)
+        combined_text.append(text)
+        
+    # Cap total context at approx 45,000 chars to avoid prompt bloat, but enough for deals
+    return "".join(combined_text)[:45000]
 
 # ════════════════════════════════════════════════════════════════════════════
 #  PRE-ANALYSIS — Detects industry, stage, listing status
@@ -193,25 +240,22 @@ Calibrate ALL benchmarks to the {profile.get('primary_industry','relevant')} sec
 #  MASTER SYSTEM PROMPT
 # ════════════════════════════════════════════════════════════════════════════
 
-SYSTEM = """You are Arjun Mehta, Principal at Sequoia Capital India with 9 years
-experience. You have personally written IC memos for 340+ deals. Three unicorns
-in your portfolio.
+SYSTEM = """You are Arjun Mehta, Senior Principal at Sequoia Capital India with 12 years of top-tier VC/PE experience. 
+You sit on the board of 4 unicorns and have personally authored IC memos for 400+ deals. 
+You are speaking directly to the Investment Committee (IC).
 
-Your IC memos are known for:
-1. Brutal honesty - you flag every red flag, even when the founder is in the room
-2. India-first lens - INR figures, Indian benchmarks, Indian regulatory context
-3. Decisive conclusions - you make a call, you never hedge
-4. Real data - for public companies you cite actual disclosed metrics
+Your analytical style:
+1. Brutally rigorous: You are known as the sharpest mind in the room. You rip apart models, identify hidden customer concentration metrics, spot unscalable unit economics, and find the subtle regulatory traps that junior analysts miss.
+2. Synthesis over summary: Do not just parrot the pitch deck back to the IC. Cross-reference the qualitative narratives in the deck with the quantitative realities in the financials.
+3. Decisive & Unforgiving: You make a definitive call. No hedging. If it's a pass, cut them deep with the exact core reason.
+4. India-First Lens: Always use INR (Crores/Lakhs), cite real Indian comparables by name, and benchmark against Indian B2B/B2C realities.
 
-Writing rules (CRITICAL - follow exactly):
-- Short punchy sentences. No corporate filler words.
-- Numbers over adjectives. Always.
-- Reference real Indian companies as benchmarks by name.
-- Write subheading labels as plain text on their own line, NO asterisks.
-- Do NOT use ** or __ or any markdown symbols anywhere in your response.
-- The output goes directly into a Word document. Clean text only.
-- If something is truly unknown: [NOT PROVIDED - Request in management Q&A]
-- Never fabricate financial figures."""
+Writing Rules (CRITICAL):
+- Write in sharp, definitive, executive sentences. Zero corporate fluff.
+- Numbers speak. Adjectives do not. Provide the calculated metric, not "they have good growth."
+- Your subheadings MUST be on their own line with NO asterisks, underscores, or markdown formatting whatsoever.
+- The output will be parsed directly into a Word document. Generate ONLY clean text. No **bolding**, no # hashtags.
+- Never hallucinate financial figures. If you calculate a derived metric (like Rule of 40), state it. If missing, say: [NOT PROVIDED - Request in management Q&A]"""
 
 # ════════════════════════════════════════════════════════════════════════════
 #  SECTION PROMPTS
@@ -221,35 +265,32 @@ def prompt_exec(deck, company, fund_type, ctx):
     return f"""
 {ctx}
 
-Write the EXECUTIVE SUMMARY AND INVESTMENT THESIS for {company}.
+Write the EXECUTIVE SUMMARY AND INVESTMENT THESIS for {company} as a Senior Principal.
 Memo format: {fund_type}
 
-Pitch deck content:
+Source Documentation (Deck, Models, etc):
 ---
-{deck[:5000]}
+{deck[:15000]}
 ---
 
-Write with these subheading labels on separate lines (NO asterisks, clean text):
+Write with these exact subheading labels on separate lines (NO asterisks, clean text):
 
 The Opportunity
-[2-3 sentences. Specific problem, who suffers, scale of pain. Lead with a number.]
+[2-3 sentences. Define the structural inefficiency in the market. Why is this a venture-scale problem? Lead with a hard number.]
 
 What {company} Does
-[Plain English product description. One paragraph. How it works end-to-end.]
+[The core mechanics of the business model. Strip away the marketing fluff. How does value actually exchange hands?]
 
-Why This, Why Now
-[Specific India tailwinds. Regulatory shift, tech unlock, consumer behaviour change.
-Be specific - not "India is a large market".]
+The Thesis
+[Your proprietary view on why this exact team wins this exact market NOW. What is the non-obvious tailwind?]
 
-Traction Snapshot
-[4-5 most important metrics. For public companies use actual disclosed figures.
-Format: Metric Name: Value]
+Traction Reality Check
+[4-5 critical top-line metrics. Synthesize the reality vs the pitch. e.g., "Revenue grew 3x but absolute Burn doubled."]
 
 Preliminary View
-[One sentence: PROCEED TO DILIGENCE / CONDITIONAL / PASS
-Then: Conviction level: High/Medium/Low - because [specific reason].]
+[One definitive sentence: PROCEED TO DILIGENCE / CONDITIONAL / PASS. Followed by a 2-sentence sharp justification.]
 
-Maximum 300 words. Write like you have 5 minutes before IC starts.
+Maximum 300 words. Executive, cynical, brilliant.
 NO asterisks. NO markdown. Clean text only.
 """
 
@@ -321,41 +362,32 @@ def prompt_recommendation(deck, company, fund_type, ctx):
     return f"""
 {ctx}
 
-Write the INVESTMENT RECOMMENDATION for {company}.
-This is the most important section. Be decisive. Memo format: {fund_type}
+Write the INVESTMENT RECOMMENDATION for {company} as a Senior VC Principal.
+This is where your reputation is made. Be decisive. Memo format: {fund_type}
 
-Pitch deck:
+Source Documentation:
 ---
-{deck[:5000]}
+{deck[:15000]}
 ---
 
 Subheadings as plain text labels (NO asterisks):
 
 Recommendation
-[First line must be exactly one of:
-RECOMMENDATION: PROCEED TO FULL DILIGENCE
-RECOMMENDATION: CONDITIONAL PROCEED
-RECOMMENDATION: PASS
-Then state check size and ownership target, OR conditions, OR reason for pass.]
+[MUST be one of: RECOMMENDATION: PROCEED TO FULL DILIGENCE / RECOMMENDATION: CONDITIONAL PROCEED / RECOMMENDATION: PASS. Justify with the single most levered insight from the data.]
 
-Bull Case - Three Year View
-[If everything goes right. Revenue, market position, comparable exit.
-Expected MOIC. Reference a DIFFERENT company that succeeded in this space as comparable.
-Do NOT reference {company} itself as the benchmark.]
+Upside Case (MOIC Target)
+[If everything breaks their way. What is the revenue ceiling in Rs Cr? What is the expected entry/exit multiple? Name a comparable exit scenario.]
 
-Bear Case
-[Most realistic failure path. Not a black swan - the most likely path to zero.
-Probability estimate as a percentage.]
+The Failure Mode
+[The most intellectually honest path to zero. Not "execution risk". E.g., "Customer acquisition costs scale linearly while LTV compresses due to infinite local alternatives, starving them of working capital."]
 
-Critical Diligence Items
-[Exactly 5 questions specific to THIS deal. Not generic. Questions that address
-the specific risks you identified above.]
+Critical Diligence Plan
+[Exactly 5 hyper-specific diligence focus areas. NOT "check product market fit". E.g., "Audit the true gross margin netting out cloud costs and payment gateway fees." or "Cohort analysis to prove M6 retention holds above 40%."]
 
-Proposed Terms
-[Information rights, board seat, pro-rata, any milestone tranches.
-Stage-appropriate for {company}.]
+Deal Structuring Thoughts
+[Your initial terms. Check size, target ownership, control provisions, tranches tied to specific KPIs.]
 
-320-360 words. The IC reads this first. Make the recommendation impossible to miss.
+350-400 words. Sharp, commanding, senior-level insights.
 NO asterisks. NO markdown. Clean text only.
 """
 
@@ -474,9 +506,9 @@ Return ONLY valid JSON. No text outside JSON. No markdown fences.
     }}
   ],
   "overall_financial_health": "Strong / Adequate / Concerning / Insufficient Data",
-  "headline_concern": "Single most important financial red flag - be specific to {company}",
-  "headline_positive": "Single most compelling financial positive - be specific",
-  "burn_runway_comment": "Burn efficiency and runway assessment calibrated to {stage} stage"
+  "headline_concern": "Single most critical financial flaw or model assumption - be highly cynical and specific to {company} data",
+  "headline_positive": "Single most compelling financial leverage point",
+  "burn_runway_comment": "Hard assessment of capital efficiency. Do they need too much capital to hit the next milestone?"
 }}
 
 Include these metrics calibrated to {industry} (use actual figures for public companies):
@@ -531,13 +563,12 @@ Return ONLY valid JSON. No text outside JSON. No markdown fences.
   "overall_risk_rating": "High / Medium-High / Medium / Medium-Low / Low"
 }}
 
-Exactly 6 risks:
-R1 = Market risk specific to {industry} in India
-R2 = Execution risk specific to {company} operating model
-R3 = Team or founder risk - be honest even if team looks strong
-R4 = Regulatory risk involving {reg_bodies} specific to {industry}
-R5 = Competitive risk - name ONE specific competitor that threatens {company}
-R6 = Financial risk for {stage} stage company
+R1 = Structural Market risk (TAM illusion, margin compression) in India
+R2 = Operating Model risk (CAC escalation, working capital trap)
+R3 = Team / Execution risk (blindspots, inability to attract senior talent)
+R4 = Regulatory / State risk (RBI/SEBI intervention, policy shifts)
+R5 = Strategic Competition risk (Big Tech entering, aggressive discounting by funded peers)
+R6 = Financial / Exit risk (Capital intensive scale-up, illiquid exit environment)
 
 deal_breaker = Yes only if this single risk alone would cause you to pass.
 All strings. No nulls.
@@ -1010,22 +1041,22 @@ with col1:
         "Family Office","Micro VC Fund","PE / Growth Equity"
     ])
 with col2:
-    pdf_file = st.file_uploader("Upload Pitch Deck (PDF)", type=["pdf"])
-    if pdf_file:
-        st.success(f"Uploaded: {pdf_file.name}")
-    st.caption("Your deck is processed in memory only. Never stored.")
+    uploaded_files = st.file_uploader("Upload Pitch Deck & Other Docs (PDF, DOCX, XLSX)", type=["pdf", "docx", "xlsx"], accept_multiple_files=True)
+    if uploaded_files:
+        st.success(f"Uploaded {len(uploaded_files)} files.")
+    st.caption("Your documents are processed in memory only. Never stored.")
 
 st.divider()
 
 if st.button("Generate IC Memo", type="primary", use_container_width=True):
     if not company:
         st.error("Please enter the company name.")
-    elif not pdf_file:
-        st.error("Please upload a pitch deck PDF.")
+    elif not uploaded_files:
+        st.error("Please upload at least one document.")
     else:
-        deck = extract_pdf(pdf_file)
+        deck = extract_documents(uploaded_files)
         if not deck.strip():
-            st.error("Could not extract text from PDF. Ensure it is not a scanned image-only file.")
+            st.error("Could not extract text from uploaded files. Ensure they are not scanned image-only files.")
             st.stop()
 
         bar    = st.progress(0)
