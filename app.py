@@ -1,7 +1,6 @@
 """
-DealMemo AI — v2.0
-Professional IC Memo Generator for Indian Startup Ecosystem
-Built for: Angel Syndicates, Category 1/2 AIFs, Family Offices, Micro VC Funds
+DealMemo AI — v3.0 Production
+Professional IC Memo Generator — Indian Startup Ecosystem
 """
 
 import os
@@ -12,7 +11,7 @@ import streamlit as st
 from groq import Groq
 import PyPDF2
 from docx import Document
-from docx.shared import Pt, RGBColor, Inches, Emu
+from docx.shared import Pt, RGBColor, Inches
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.oxml.ns import qn
 from docx.oxml import OxmlElement
@@ -23,1091 +22,1012 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 import numpy as np
-from dotenv import load_dotenv
 
-load_dotenv()
+# ─── SECRETS — works on both Streamlit Cloud and local ──────────────────────
+def get_secret(key: str) -> str:
+    # Try Streamlit secrets first (Streamlit Cloud)
+    try:
+        return st.secrets[key]
+    except Exception:
+        pass
+    # Fall back to environment variable (local .env)
+    return os.environ.get(key, "")
 
-# ─── API CONFIGURATION ──────────────────────────────────────────────────────
-GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
-client = Groq(api_key=GROQ_API_KEY)
+# ─── COLOUR PALETTE ─────────────────────────────────────────────────────────
+NAVY       = "1F3864"
+DARK_BLUE  = "1F4E79"
+MID_BLUE   = "2E75B6"
+LIGHT_BLUE = "D6E4F0"
+GREEN      = "1E8449"
+AMBER      = "D68910"
+RED        = "C0392B"
+GREY       = "7F8C8D"
+WHITE      = "FFFFFF"
 
-# Primary model — best quality on Groq free tier
-PRIMARY_MODEL   = "llama-3.3-70b-versatile"
-# Fallback model — in case primary hits rate limits
-FALLBACK_MODEL  = "llama3-70b-8192"
+# ─── GROQ CLIENT ────────────────────────────────────────────────────────────
+@st.cache_resource
+def get_client():
+    api_key = get_secret("GROQ_API_KEY")
+    if not api_key:
+        st.error(
+            "GROQ_API_KEY not found. Please add it to Streamlit Secrets "
+            "(Settings → Secrets) in the format: "
+            'GROQ_API_KEY = "your_key_here"'
+        )
+        st.stop()
+    return Groq(api_key=api_key)
 
-# ─── COLOUR PALETTE (used in charts + Word doc) ──────────────────────────────
-NAVY        = "1F3864"   # Section headings
-DARK_BLUE   = "1F4E79"   # Table headers
-MID_BLUE    = "2E75B6"   # Accent
-LIGHT_BLUE  = "D6E4F0"   # Alternating rows
-GREEN       = "1E8449"   # Positive / Strong
-AMBER       = "D68910"   # Medium / Acceptable
-RED         = "C0392B"   # Negative / Weak / High Risk
-GREY        = "7F8C8D"   # Muted text
-WHITE       = "FFFFFF"
+PRIMARY_MODEL  = "llama-3.3-70b-versatile"
+FALLBACK_MODEL = "llama3-70b-8192"
 
 # ─── SAFE AI CALL — NEVER CRASHES ───────────────────────────────────────────
 def safe_ai_call(messages: list, expect_json: bool = False,
                  max_tokens: int = 1200) -> str:
-    """
-    Wraps every Groq API call with:
-    - Primary model attempt
-    - Automatic fallback to secondary model on rate limit
-    - JSON extraction and validation if expect_json=True
-    - Graceful error string on total failure (never raises)
-    """
-    for model in [PRIMARY_MODEL, FALLBACK_MODEL]:
+    client = get_client()
+    for attempt, model in enumerate([PRIMARY_MODEL, FALLBACK_MODEL]):
         try:
             response = client.chat.completions.create(
                 model=model,
                 messages=messages,
-                temperature=0.25 if expect_json else 0.4,
+                temperature=0.2 if expect_json else 0.35,
                 max_tokens=max_tokens,
             )
             raw = response.choices[0].message.content.strip()
 
             if expect_json:
-                # Strip markdown code fences if present
                 raw = re.sub(r"```(?:json)?", "", raw).strip()
-                # Validate — if invalid, return empty structure
+                raw = raw.strip("`").strip()
                 try:
                     json.loads(raw)
                     return raw
                 except json.JSONDecodeError:
-                    # Try to extract JSON substring
                     match = re.search(r"\{[\s\S]*\}", raw)
                     if match:
                         candidate = match.group(0)
-                        json.loads(candidate)   # validate
-                        return candidate
+                        try:
+                            json.loads(candidate)
+                            return candidate
+                        except Exception:
+                            pass
                     return "{}"
             return raw
 
         except Exception as e:
-            err = str(e)
-            if "rate_limit" in err.lower() or "429" in err:
-                time.sleep(8)
-                continue          # try fallback model
-            # Non-rate-limit error — return graceful placeholder
+            err = str(e).lower()
+            if "rate" in err or "429" in err or "quota" in err:
+                wait = 12 if attempt == 0 else 20
+                time.sleep(wait)
+                continue
             return (
-                '{"error": "Could not generate this section. '
-                'Please retry."}' if expect_json
-                else "[Section could not be generated — please retry.]"
+                '{"error": "API error. Please retry."}' if expect_json
+                else f"[Could not generate — API error: {str(e)[:80]}]"
             )
     return (
-        '{"error": "Rate limit reached. Please wait 60s and retry."}'
-        if expect_json
+        '{"error": "Rate limit. Please wait 60s."}' if expect_json
         else "[Rate limit reached — please wait 60 seconds and retry.]"
     )
 
-
-# ─── PDF TEXT EXTRACTION ─────────────────────────────────────────────────────
+# ─── PDF EXTRACTION ──────────────────────────────────────────────────────────
 def extract_pdf_text(pdf_file) -> str:
     try:
         reader = PyPDF2.PdfReader(pdf_file)
-        pages = []
+        pages  = []
         for page in reader.pages:
             text = page.extract_text()
-            if text:
+            if text and text.strip():
                 pages.append(text.strip())
-        return "\n\n".join(pages)[:12000]
-    except Exception:
+        full = "\n\n".join(pages)
+        return full[:14000]
+    except Exception as e:
         return ""
 
+# ════════════════════════════════════════════════════════════════════════════
+#  MASTER SYSTEM PROMPT
+# ════════════════════════════════════════════════════════════════════════════
+
+SYSTEM = """You are Arjun Mehta, a Principal at a top-tier Indian VC fund 
+with 9 years of experience across Sequoia Capital India and Lightspeed India. 
+You have personally sourced, diligenced, and written IC memos for 340+ deals 
+across Series A through growth stage. Your investments include companies that 
+went on to become unicorns.
+
+Your IC memos are known for three things:
+1. Brutal honesty — you flag every red flag, even when the founder is 
+   in the room
+2. India-first lens — you never use US benchmarks when Indian ones exist
+3. Decisive conclusions — you never hedge. You make a call.
+
+Your writing style:
+- Short, punchy sentences. No corporate speak.
+- Numbers over adjectives. Always.
+- If data is missing, you say exactly what you asked for and didn't get.
+- You reference real Indian companies as benchmarks 
+  (Zepto, Groww, CRED, Razorpay, Meesho, PhonePe, Swiggy, Zomato, 
+  Nykaa, Mamaearth, Urban Company, Dunzo, Ola, Byju's, Unacademy)
+
+When information is missing from the deck you write:
+[NOT PROVIDED — Request in management Q&A]
+
+You NEVER fabricate financial figures.
+You NEVER use phrases like "it is worth noting" or "it should be mentioned".
+You write like you are presenting to a room of senior partners who have 
+15 minutes and zero patience for fluff."""
 
 # ════════════════════════════════════════════════════════════════════════════
-#  PROMPT LIBRARY — Each prompt is engineered for maximum output quality
+#  SECTION PROMPTS — Production Grade
 # ════════════════════════════════════════════════════════════════════════════
 
-SYSTEM_PROMPT = """You are a Senior Investment Analyst with 9 years of 
-experience at a top-tier Indian VC fund (think Sequoia India, Accel India, 
-Lightspeed India). You have personally reviewed and written IC memos for 
-300+ deals across fintech, edtech, D2C, SaaS, healthtech, agritech, and 
-consumer internet in India.
-
-Your writing is:
-- Precise, direct, and analytical — never fluffy or promotional
-- Deeply calibrated to Indian market realities (INR figures, Indian 
-  regulatory context, Indian consumer behaviour, Indian competitive 
-  landscape)
-- Honest about weaknesses — you flag red flags clearly
-- Referenced against real Indian startup benchmarks (Zepto, Groww, CRED, 
-  Razorpay, Meesho, PhonePe, Swiggy, Zomato, Ola, Byju's, Nykaa, Mamaearth)
-- Formatted for an Investment Committee — not a blog post
-
-When information is missing from the deck you write exactly:
-[DATA UNAVAILABLE — Recommend requesting from management]
-
-You NEVER make up financial figures. You NEVER use marketing language.
-You ALWAYS flag founder/team red flags if present."""
-
-
-def prompt_executive_summary(deck: str, company: str, fund_type: str) -> str:
+def prompt_exec_summary(deck, company, fund_type):
     return f"""
-{SYSTEM_PROMPT}
+Write the EXECUTIVE SUMMARY & INVESTMENT THESIS for {company}.
+Memo format: {fund_type}
 
-TASK: Write the EXECUTIVE SUMMARY & INVESTMENT THESIS section of a 
-professional Investment Committee memo.
-
-COMPANY: {company}
-MEMO TYPE: {fund_type}
-
-PITCH DECK CONTENT:
+Pitch deck:
 ---
-{deck[:4000]}
+{deck[:5000]}
 ---
 
-STRUCTURE YOUR RESPONSE AS FOLLOWS (use these exact subheadings in bold):
+Structure your response with these exact bold headers:
 
 **The Opportunity**
-2-3 sentences. What is the company, what problem does it solve, and why 
-does this problem exist at scale in India today.
+What problem exists, who suffers from it, and how big is the pain. 
+Specific to India. 2-3 sentences maximum. Lead with a number if possible.
 
-**Investment Thesis**
-3-4 sentences. The core reason to invest. What has to be true for this 
-to be a great outcome. What is the bull case.
+**What {company} Does**
+Product or service in plain English. How it works. Who pays. 
+One short paragraph — no jargon.
 
-**Key Metrics at a Glance**
-List the 4-5 most important numbers from the deck (revenue, growth rate, 
-GMV, users, retention — whatever is most relevant). If not available, 
-flag as [DATA UNAVAILABLE].
+**Why This, Why Now**
+Specific macro or micro tailwinds making this the right moment. 
+Regulatory shift, technology unlock, consumer behaviour change, 
+competitive whitespace. Be specific — not "India is a large market."
 
-**Why Now**
-2-3 sentences. Why is this the right time for this company to exist and 
-to raise capital. Market timing, regulatory tailwinds, technology shifts.
+**Traction Snapshot**
+The 4-5 most important metrics from the deck. If not stated, write 
+[NOT PROVIDED]. Format as: Metric: Value (e.g., MoM Growth: 23%)
 
-**Preliminary Recommendation**
-One clear sentence: Proceed to full diligence / Pass / Conditional proceed.
-Give a confidence level: High / Medium / Low.
+**Preliminary View**
+One sentence verdict: PROCEED TO DILIGENCE / CONDITIONAL / PASS.
+Follow with: "Conviction level: High / Medium / Low — because [reason]."
 
-Length: 280-320 words total. No bullet points except in Key Metrics.
+Do not exceed 300 words. Write like you have 5 minutes before the IC meeting.
 """
 
-
-def prompt_company_overview(deck: str, company: str, fund_type: str) -> str:
+def prompt_company_overview(deck, company, fund_type):
     return f"""
-{SYSTEM_PROMPT}
+Write the COMPANY OVERVIEW & BUSINESS MODEL section for {company}.
+Memo format: {fund_type}
 
-TASK: Write the COMPANY OVERVIEW & BUSINESS MODEL section of a professional 
-IC memo.
-
-COMPANY: {company}
-MEMO TYPE: {fund_type}
-
-PITCH DECK CONTENT:
+Pitch deck:
 ---
-{deck[:4000]}
+{deck[:5000]}
 ---
 
-STRUCTURE YOUR RESPONSE AS FOLLOWS:
+Structure with these exact bold headers:
 
-**Business Description**
-What the company does in plain language. Product or service. How it works 
-end-to-end. Target customer segment.
+**What They Do**
+Product description in 2-3 sentences. Avoid repeating the company's 
+own marketing language. Describe it as you would to a sceptical LP.
 
-**Revenue Model**
-How the company makes money. All revenue streams. Pricing model. Take rate 
-if marketplace. Is the model proven or hypothetical.
+**How They Make Money**
+All revenue streams. Pricing model. Take rate if marketplace. 
+Is unit economics proven or theoretical? Be specific.
 
-**Stage & Traction**
-Current stage (idea / MVP / early revenue / scaling). Key traction metrics. 
-What has been validated vs what is still assumption.
+**Customer**
+Exact customer segment. B2B, B2C, or B2B2C. Geographic focus. 
+What does the customer pay and why do they pay it.
 
-**Operational Model**
-Key operational levers. Unit of production. What scales and what doesn't. 
-Geographic focus and expansion plan.
+**Current Stage & Validation**
+What has been proven vs what is still assumed. What does "traction" 
+actually mean for this company at this stage.
 
-**Regulatory Considerations**
-Any SEBI, RBI, DPIIT, FSSAI, or other Indian regulatory factors that 
-affect this business model. Flag any compliance risks.
+**Regulatory & Structural Risks**
+SEBI, RBI, FSSAI, MeitY, or any other Indian regulatory body relevant 
+to this business. Flag compliance risks explicitly. If none, say "No 
+material regulatory risk identified at this stage."
 
-Length: 260-300 words. Short paragraphs only. No bullet points.
+250-280 words. Short paragraphs. No bullet points.
 """
 
-
-def prompt_market_opportunity(deck: str, company: str, fund_type: str) -> str:
+def prompt_market_opp(deck, company, fund_type):
     return f"""
-{SYSTEM_PROMPT}
+Write the MARKET OPPORTUNITY section for {company}.
+Memo format: {fund_type}
 
-TASK: Write the MARKET OPPORTUNITY section of a professional IC memo.
-
-COMPANY: {company}
-MEMO TYPE: {fund_type}
-
-PITCH DECK CONTENT:
+Pitch deck:
 ---
-{deck[:4000]}
+{deck[:5000]}
 ---
 
-STRUCTURE YOUR RESPONSE AS FOLLOWS:
+Structure with these exact bold headers:
 
 **Market Context**
-2-3 sentences on why this market is interesting in India right now. 
-Macro tailwinds, demographic shifts, digital penetration trends.
+Why this market is interesting in India specifically. 
+What structural shift is creating this opportunity. 
+Cite a specific data point or trend — not a generic statement.
 
-**TAM / SAM / SOM Analysis**
-Provide your own analyst estimate of TAM, SAM, and SOM using a 
-bottom-up approach where possible. Use INR figures. Cross-check 
-any figures from the deck against your own analysis. If the 
-company's TAM claim appears inflated, say so explicitly.
+**Size Assessment**
+TAM, SAM, SOM — your own bottom-up estimate using Indian data. 
+Challenge the company's numbers if they appear inflated. Be direct: 
+"The company claims ₹X TAM. Our estimate is ₹Y because Z."
+Use INR Crores. Show your reasoning in 2 sentences.
 
 **Market Structure**
-Is this a fragmented or consolidated market. Who are the incumbent 
-players. Is there a dominant leader or is the market still open.
+Fragmented or consolidated. Who are the 2-3 biggest players today. 
+Is there a dominant leader or is the market still open. 
+How much of the market is still offline or unorganised.
 
-**Analyst Assessment**
-Your honest view: Is this a large enough market for a venture-scale 
-outcome. What share does the company need to capture to return the fund.
+**Analyst View**
+Can this company realistically build a ₹500Cr+ revenue business 
+from this market. What market share does that require. 
+Is that achievable given competition. Your honest assessment.
 
-Length: 260-300 words. TAM/SAM/SOM can use numbers inline.
+250-280 words. Lead with the most important insight, not background.
 """
 
-
-def prompt_investment_recommendation(deck: str, company: str,
-                                     fund_type: str) -> str:
+def prompt_recommendation(deck, company, fund_type):
     return f"""
-{SYSTEM_PROMPT}
+Write the INVESTMENT RECOMMENDATION section for {company}.
+Memo format: {fund_type}
 
-TASK: Write the INVESTMENT RECOMMENDATION section — the final and most 
-critical section of the IC memo.
+Pitch deck:
+---
+{deck[:5000]}
+---
 
-COMPANY: {company}
-MEMO TYPE: {fund_type}
+This is the most important section. Make it decisive.
 
-PITCH DECK CONTENT:
+Structure with these exact bold headers:
+
+**Recommendation**
+State clearly on line 1: 
+"RECOMMENDATION: PROCEED TO FULL DILIGENCE" or 
+"RECOMMENDATION: CONDITIONAL PROCEED" or 
+"RECOMMENDATION: PASS"
+
+If PROCEED: State proposed check size and target ownership %.
+If CONDITIONAL: State exactly 2-3 conditions that must be met.
+If PASS: State the single biggest reason.
+
+**Bull Case (3-Year)**
+If everything goes right — what does this company look like. 
+Revenue, market position, comparable exit. Expected MOIC. 
+Be specific: "If {company} follows Zepto's trajectory..."
+
+**Bear Case**
+The most realistic failure scenario. Not a black swan — the 
+most likely way this investment goes to zero. Probability estimate.
+
+**Critical Diligence Items**
+Exactly 5 questions the IC must answer before committing capital. 
+Not generic DD questions — questions specific to this deal and 
+the specific risks you have identified.
+
+**Proposed Terms**
+Information rights, board seat (if applicable), pro-rata rights, 
+milestone tranches (if conditional). What protective provisions 
+make sense given the stage and risk profile.
+
+320-360 words. The IC will read this section first. Make the 
+recommendation impossible to misunderstand.
+"""
+
+def prompt_competitive(deck, company):
+    return f"""
+Analyse the competitive landscape for {company}.
+
+Pitch deck:
 ---
 {deck[:4000]}
 ---
 
-STRUCTURE YOUR RESPONSE AS FOLLOWS:
-
-**Recommendation**
-State clearly: PROCEED TO FULL DILIGENCE / CONDITIONAL PROCEED / PASS
-For PROCEED: State the proposed check size and ownership target.
-For CONDITIONAL: State exactly what conditions must be met.
-For PASS: State the primary reason.
-
-**Bull Case**
-If everything goes right — what does this look like in 5 years. 
-Comparable outcome (e.g. "If this follows Zepto's trajectory..."). 
-Expected return multiple.
-
-**Bear Case**
-The most realistic failure scenario. What kills this company. 
-Probability of bear case in your assessment.
-
-**Key Diligence Questions**
-The 5 most important questions the IC must answer before committing. 
-Be specific — not generic questions but questions specific to this deal.
-
-**Conditions & Covenants**
-Any protective provisions, information rights, board seat requirements, 
-or milestone-based tranches you would recommend.
-
-Length: 300-340 words. This section must read like a decisive analyst 
-recommendation — not a "on one hand / on the other hand" hedge.
-"""
-
-
-def prompt_competitive_table(deck: str, company: str) -> str:
-    return f"""
-{SYSTEM_PROMPT}
-
-TASK: Generate a competitive landscape analysis for {company}.
-
-PITCH DECK CONTENT:
----
-{deck[:3500]}
----
-
-Return ONLY a valid JSON object. No text before or after. No markdown.
-No code fences. Just the raw JSON.
-
-The JSON must follow this exact structure:
+Return ONLY valid JSON. Zero text outside the JSON. No markdown fences.
 
 {{
   "rows": [
     {{
-      "company": "Competitor company name",
-      "founded": "Year founded",
-      "funding": "Total funding raised (INR or USD)",
-      "product_focus": "Core product in 5 words",
-      "business_model": "Revenue model in 4 words",
-      "india_presence": "Yes / No / Limited",
-      "key_strength": "Their strongest competitive advantage",
-      "key_weakness": "Their most exploitable weakness",
-      "threat_level": "High / Medium / Low"
+      "company": "string",
+      "stage": "string — e.g. Series B / Public / Bootstrapped",
+      "funding_raised": "string — e.g. $45M / ₹320Cr / Undisclosed",
+      "core_product": "string — 6 words max",
+      "revenue_model": "string — 5 words max",
+      "india_focus": "Primary / Secondary / None",
+      "moat": "string — their single strongest competitive advantage",
+      "weakness": "string — their most exploitable weakness",
+      "threat_to_subject": "High / Medium / Low",
+      "threat_rationale": "string — one sentence why"
     }}
-  ]
+  ],
+  "competitive_summary": "string — 2 sentence analyst view on competitive intensity and {company} positioning"
 }}
 
 Rules:
-- Include 4-5 real competitors. Research your training knowledge carefully.
-- The LAST row must be {company} itself for self-comparison.
-- Mark {company}'s row with company name exactly as "{company} (Subject)"
-- Prioritise India-based or India-focused competitors.
-- threat_level = High means this competitor directly threatens the subject.
-- Be honest and analytical. Do not favour the subject company.
-- All values must be strings. No null values — use "N/A" if unknown.
+- Include 4-5 real competitors using your training knowledge
+- Last row must be {company} with company field = "{company} ★"
+- threat_to_subject for {company} row = "Subject"
+- All strings. No nulls. Use "Undisclosed" not null for unknown funding.
+- Be analytically honest — do not favour {company}
 """
 
-
-def prompt_team_table(deck: str, company: str) -> str:
+def prompt_team(deck, company):
     return f"""
-{SYSTEM_PROMPT}
+Assess the founding and leadership team of {company}.
 
-TASK: Assess the founding and leadership team of {company}.
-
-PITCH DECK CONTENT:
+Pitch deck:
 ---
-{deck[:3500]}
+{deck[:4000]}
 ---
 
-Return ONLY a valid JSON object. No text before or after. No markdown.
+Return ONLY valid JSON. Zero text outside the JSON. No markdown fences.
 
 {{
-  "rows": [
+  "members": [
     {{
-      "name": "Full name",
-      "title": "Job title",
-      "prior_company": "Most impressive prior employer",
-      "prior_role": "Prior role title",
-      "relevant_experience": "Why this experience is directly relevant",
-      "education": "Highest relevant degree and institution",
+      "name": "string",
+      "title": "string",
+      "previous_employer": "string — most impressive prior company",
+      "previous_role": "string",
+      "years_experience": "string — e.g. 8 years",
+      "direct_relevance": "string — how prior experience applies HERE",
+      "education": "string — degree, institution",
       "flag": "Green / Yellow / Red",
-      "flag_reason": "One sentence explaining the flag"
+      "flag_note": "string — specific reason for flag in one sentence"
     }}
   ],
-  "team_summary": "2 sentence overall team assessment. Be honest.",
-  "missing_roles": "Key C-suite or functional roles not yet hired"
+  "team_verdict": "string — 3 sentence honest assessment. Call out gaps.",
+  "missing_hires": "string — critical roles not yet filled",
+  "founder_risk": "High / Medium / Low",
+  "founder_risk_reason": "string — one sentence"
 }}
 
-Flag guidance:
-- Green: Strong pedigree, directly relevant experience, proven operator
-- Yellow: Adequate but gaps exist — flag the gap specifically  
-- Red: Concerning — no relevant experience, first-time founder in 
-  complex regulated space, or key info not disclosed
+Flag criteria:
+Green = proven operator, directly relevant experience, strong pedigree
+Yellow = adequate but a specific gap exists — name the gap
+Red = first-time founder in complex space, no relevant experience, 
+      or key person not disclosed in deck
 
-If a team member is not mentioned in the deck, add a row:
-name = "[Not Disclosed]", flag = "Red", 
-flag_reason = "Key role not mentioned in deck"
-
-All values must be strings. No null values.
+If a C-suite role is not mentioned, add member with name = 
+"[Role] — Not Disclosed" and flag = Red.
 """
 
-
-def prompt_financials_table(deck: str, company: str, fund_type: str) -> str:
+def prompt_financials(deck, company, fund_type):
     return f"""
-{SYSTEM_PROMPT}
+Extract and assess unit economics for {company}.
+Memo format: {fund_type}
 
-TASK: Extract and assess unit economics and financial metrics for {company}.
-
-PITCH DECK CONTENT:
+Pitch deck:
 ---
-{deck[:3500]}
+{deck[:4000]}
 ---
 
-Return ONLY a valid JSON object. No text before or after. No markdown.
+Return ONLY valid JSON. Zero text outside the JSON. No markdown fences.
 
 {{
   "metrics": [
     {{
-      "metric": "Metric name",
-      "reported_value": "Value from deck or [Not Disclosed]",
-      "analyst_note": "Your assessment of this figure",
-      "india_benchmark": "Typical range for this metric in Indian startups",
-      "assessment": "Strong / Acceptable / Weak / Not Disclosed"
+      "metric": "string",
+      "reported_value": "string — exact value from deck or NOT PROVIDED",
+      "analyst_comment": "string — your assessment in one sentence",
+      "india_benchmark": "string — typical range for Indian startups at this stage",
+      "rating": "Strong / Acceptable / Weak / Not Provided"
     }}
   ],
-  "financial_summary": "3 sentence analyst assessment of overall financial health and quality of metrics disclosed.",
-  "key_concern": "The single most important financial concern for the IC."
+  "overall_financial_health": "Strong / Adequate / Concerning / Insufficient Data",
+  "headline_concern": "string — the single most important financial red flag",
+  "headline_positive": "string — the single most compelling financial positive",
+  "burn_runway_comment": "string — assessment of burn efficiency and runway"
 }}
 
-Always include these metrics in this order (use [Not Disclosed] if absent):
-1. Monthly Revenue Run Rate (INR)
-2. Month-on-Month Revenue Growth
-3. Gross Margin %
-4. Customer Acquisition Cost (CAC)
-5. Customer Lifetime Value (LTV)
-6. LTV / CAC Ratio
-7. Monthly Burn Rate (INR)
-8. Runway (months)
-9. Monthly Active Users / Customers
-10. Net Revenue Retention or Churn Rate
+Include ALL of these metrics in this exact order:
+1. ARR or Revenue Run Rate
+2. MoM Revenue Growth
+3. Gross Margin
+4. Contribution Margin
+5. Customer Acquisition Cost (CAC)
+6. Lifetime Value (LTV)
+7. LTV/CAC Ratio
+8. Payback Period
+9. Monthly Burn Rate
+10. Runway (months at current burn)
+11. Net Revenue Retention (NRR) or Churn
+12. Active Users / Customers
 
-All values must be strings. No null values.
+For every metric not in the deck: reported_value = "NOT PROVIDED",
+rating = "Not Provided". Never fabricate numbers.
 """
 
-
-def prompt_risk_table(deck: str, company: str, fund_type: str) -> str:
+def prompt_risks(deck, company, fund_type):
     return f"""
-{SYSTEM_PROMPT}
+Identify investment risks for {company}.
+Memo format: {fund_type}
 
-TASK: Identify and assess key investment risks for {company}.
-
-PITCH DECK CONTENT:
+Pitch deck:
 ---
-{deck[:3500]}
+{deck[:4000]}
 ---
 
-Return ONLY a valid JSON object. No text before or after. No markdown.
+Return ONLY valid JSON. Zero text outside the JSON. No markdown fences.
 
 {{
-  "rows": [
+  "risks": [
     {{
-      "risk_category": "Category (Market/Execution/Team/Regulatory/Financial/Technology/Competition)",
-      "risk_title": "Short title (5 words max)",
-      "risk_description": "Specific risk description for this company (not generic)",
+      "id": "R1",
+      "category": "Market / Execution / Team / Regulatory / Financial / Technology / Competition",
+      "title": "string — 4-6 words, specific to this company",
+      "description": "string — 2 sentences. Specific to {company} not generic.",
       "probability": "High / Medium / Low",
       "impact": "High / Medium / Low",
-      "time_horizon": "Near-term (0-12m) / Medium-term (1-3y) / Long-term (3y+)",
-      "mitigant": "Specific mitigating factor or action",
-      "residual_risk": "High / Medium / Low (after mitigation)"
+      "time_horizon": "0-12 months / 1-3 years / 3+ years",
+      "mitigant": "string — specific action or factor that reduces this risk",
+      "residual_risk": "High / Medium / Low",
+      "deal_breaker": "Yes / No"
     }}
   ],
-  "risk_summary": "2 sentence overall risk assessment. Most critical risk and why."
+  "risk_summary": "string — 2 sentences. Overall risk profile and the single risk that could kill this deal.",
+  "overall_risk_rating": "High / Medium-High / Medium / Medium-Low / Low"
 }}
 
-Include exactly 6 risks covering:
-1. One market risk (TAM, timing, macro)
-2. One execution risk (ops, scaling, product)
-3. One team/founder risk (be honest — even if team looks strong)
-4. One regulatory/compliance risk (India-specific)
-5. One competitive risk (specific named competitor threat)
-6. One financial risk (burn, runway, fundraising)
+Include exactly 6 risks:
+R1 = Market risk (timing, size, or demand)
+R2 = Execution risk (ops, product, scaling)  
+R3 = Team / founder risk (be honest even if team looks strong)
+R4 = Regulatory risk (India-specific laws, compliance)
+R5 = Competitive risk (name a specific competitor threat)
+R6 = Financial risk (burn, runway, next round risk)
 
-Be specific to this company — generic risks are not useful.
-All values must be strings. No null values.
+deal_breaker = Yes only if this single risk alone would cause you to pass.
 """
 
+# ════════════════════════════════════════════════════════════════════════════
+#  TAM EXTRACTION
+# ════════════════════════════════════════════════════════════════════════════
+def extract_tam(deck, company):
+    raw = safe_ai_call(
+        messages=[
+            {"role": "system",
+             "content": "Return only valid JSON. No text. No markdown."},
+            {"role": "user", "content": f"""
+Extract or estimate TAM/SAM/SOM for {company} in INR Crores.
+Return ONLY this JSON:
+{{"tam": <integer>, "sam": <integer>, "som": <integer>}}
+SAM < TAM. SOM < SAM. Integers only. No quotes around numbers.
+Deck: {deck[:2000]}
+"""}
+        ],
+        expect_json=True, max_tokens=80
+    )
+    try:
+        d = json.loads(raw)
+        if d.get("tam", 0) > 0:
+            return d
+    except Exception:
+        pass
+    return {"tam": 45000, "sam": 10000, "som": 2000}
 
 # ════════════════════════════════════════════════════════════════════════════
-#  CHART GENERATION — Embedded in Word document
+#  CHART GENERATORS
 # ════════════════════════════════════════════════════════════════════════════
 
-def make_tam_chart(tam_data: dict, company: str) -> BytesIO:
-    """
-    Creates a professional TAM/SAM/SOM funnel bar chart.
-    Returns PNG image as BytesIO.
-    """
-    fig, ax = plt.subplots(figsize=(7, 3.5))
-    fig.patch.set_facecolor("#F8FAFC")
-    ax.set_facecolor("#F8FAFC")
+def chart_tam(tam_data, company):
+    fig, ax = plt.subplots(figsize=(7, 3.2))
+    fig.patch.set_facecolor("#F7FAFC")
+    ax.set_facecolor("#F7FAFC")
 
-    labels = ["TAM\n(Total Addressable Market)",
-              "SAM\n(Serviceable Addressable Market)",
-              "SOM\n(Serviceable Obtainable Market)"]
-    values = [
-        tam_data.get("tam_inr", 50000),
-        tam_data.get("sam_inr", 15000),
-        tam_data.get("som_inr", 3000),
-    ]
+    labels = ["TAM", "SAM", "SOM"]
+    values = [tam_data.get("tam", 45000),
+              tam_data.get("sam", 10000),
+              tam_data.get("som", 2000)]
     colours = ["#1F4E79", "#2E75B6", "#9DC3E6"]
 
-    bars = ax.barh(labels, values, color=colours, height=0.5, edgecolor="white")
+    bars = ax.barh(labels, values, color=colours,
+                   height=0.45, edgecolor="white", linewidth=1.5)
 
-    # Value labels
     for bar, val in zip(bars, values):
-        unit = "Cr" if val >= 100 else "L"
-        display = f"₹{val:,.0f} {unit}"
-        ax.text(bar.get_width() + max(values) * 0.01,
+        label = f"₹{val:,} Cr"
+        ax.text(bar.get_width() + max(values) * 0.015,
                 bar.get_y() + bar.get_height() / 2,
-                display, va="center", fontsize=9,
+                label, va="center", fontsize=10,
                 color="#1F3864", fontweight="bold")
 
-    ax.set_xlabel("INR (Crores)", fontsize=9, color="#7F8C8D")
-    ax.set_title(f"{company} — Market Sizing",
-                 fontsize=11, fontweight="bold", color="#1F3864", pad=10)
-    ax.tick_params(colors="#5D6D7E", labelsize=9)
-    ax.spines["top"].set_visible(False)
-    ax.spines["right"].set_visible(False)
+    ax.set_title(f"{company} — Market Sizing (INR Crores)",
+                 fontsize=11, fontweight="bold",
+                 color="#1F3864", pad=12)
+    ax.set_xlabel("INR Crores", fontsize=9, color="#7F8C8D")
+    ax.set_xlim(0, max(values) * 1.28)
+    ax.tick_params(labelsize=10, colors="#34495E")
+    for spine in ["top", "right"]:
+        ax.spines[spine].set_visible(False)
     ax.spines["left"].set_color("#BDC3C7")
     ax.spines["bottom"].set_color("#BDC3C7")
-    ax.set_xlim(0, max(values) * 1.25)
 
     plt.tight_layout()
     buf = BytesIO()
-    plt.savefig(buf, format="png", dpi=150, bbox_inches="tight",
-                facecolor=fig.get_facecolor())
+    plt.savefig(buf, format="png", dpi=150,
+                bbox_inches="tight", facecolor="#F7FAFC")
     plt.close(fig)
     buf.seek(0)
     return buf
 
 
-def make_risk_heatmap(risk_rows: list) -> BytesIO:
-    """
-    Creates a professional risk heatmap (probability vs impact matrix).
-    Returns PNG image as BytesIO.
-    """
-    fig, ax = plt.subplots(figsize=(6, 4))
-    fig.patch.set_facecolor("#F8FAFC")
+def chart_risk_heatmap(risks):
+    fig, ax = plt.subplots(figsize=(6.5, 4.5))
+    fig.patch.set_facecolor("#F7FAFC")
     ax.set_facecolor("#FDFEFE")
 
-    # Background quadrant colours
-    quadrants = [
-        (0, 0, 1, 1, "#FDFEFE"),    # Low/Low  — white
-        (1, 0, 1, 1, "#FEF9E7"),    # High/Low — light yellow
-        (0, 1, 1, 1, "#FEF9E7"),    # Low/High — light yellow
-        (1, 1, 1, 1, "#FDEDEC"),    # High/High — light red
+    # Zone backgrounds
+    zones = [
+        (0, 0, 1, 1, "#EBF5FB"),  # Low/Low
+        (1, 0, 1, 1, "#FEF9E7"),  # Med/Low
+        (2, 0, 1, 1, "#FDEDEC"),  # High/Low
+        (0, 1, 1, 1, "#FEF9E7"),  # Low/Med
+        (1, 1, 1, 1, "#FEF5E7"),  # Med/Med
+        (2, 1, 1, 1, "#FDEDEC"),  # High/Med
+        (0, 2, 1, 1, "#FDEDEC"),  # Low/High
+        (1, 2, 1, 1, "#FDEDEC"),  # Med/High
+        (2, 2, 1, 1, "#F9EBEA"),  # High/High
     ]
-    for x, y, w, h, c in quadrants:
-        ax.add_patch(mpatches.Rectangle((x, y), w, h, color=c, zorder=0))
+    for x, y, w, h, c in zones:
+        ax.add_patch(mpatches.Rectangle(
+            (x, y), w, h, color=c, zorder=0))
 
-    level_map = {"Low": 0.5, "Medium": 1.5, "High": 2.5}
-    color_map = {"High": "#C0392B", "Medium": "#D68910", "Low": "#1E8449"}
-
+    level = {"Low": 0, "Medium": 1, "High": 2}
+    clr   = {"High": "#C0392B", "Medium": "#D68910", "Low": "#1E8449"}
     plotted = []
-    for i, row in enumerate(risk_rows[:6]):
-        prob  = row.get("probability", "Medium")
-        impact = row.get("impact", "Medium")
-        px = level_map.get(prob, 1.5)
-        py = level_map.get(impact, 1.5)
 
-        # Slight offset if overlapping
-        offset = 0.08 * sum(1 for p in plotted if abs(p[0]-px) < 0.2
-                            and abs(p[1]-py) < 0.2)
-        px += offset
-        py += offset
+    for r in risks[:6]:
+        px = level.get(r.get("probability", "Medium"), 1) + 0.5
+        py = level.get(r.get("impact",      "Medium"), 1) + 0.5
+        # Jitter if overlapping
+        jitter = 0.1 * sum(
+            1 for p in plotted
+            if abs(p[0]-px) < 0.25 and abs(p[1]-py) < 0.25
+        )
+        px += jitter; py += jitter
         plotted.append((px, py))
 
-        col = color_map.get(prob, "#7F8C8D")
-        ax.scatter(px, py, s=180, color=col, zorder=5, edgecolors="white",
-                   linewidths=1.5)
+        col = clr.get(r.get("probability", "Medium"), "#7F8C8D")
+        db  = "★ " if r.get("deal_breaker") == "Yes" else ""
+        ax.scatter(px, py, s=220, color=col, zorder=5,
+                   edgecolors="white", linewidths=2)
         ax.annotate(
-            row.get("risk_title", f"Risk {i+1}"),
-            (px, py), textcoords="offset points", xytext=(6, 4),
-            fontsize=7, color="#1F3864", fontweight="bold",
-            bbox=dict(boxstyle="round,pad=0.2", facecolor="white",
-                      edgecolor="#BDC3C7", alpha=0.85)
+            db + r.get("id", "") + ": " + r.get("title", "")[:22],
+            (px, py), textcoords="offset points", xytext=(8, 5),
+            fontsize=7.5, color="#1F3864", fontweight="bold",
+            bbox=dict(boxstyle="round,pad=0.25", facecolor="white",
+                      edgecolor="#BDC3C7", alpha=0.9)
         )
 
-    # Axis config
-    ax.set_xlim(0, 3)
-    ax.set_ylim(0, 3)
+    ax.set_xlim(0, 3); ax.set_ylim(0, 3)
     ax.set_xticks([0.5, 1.5, 2.5])
     ax.set_yticks([0.5, 1.5, 2.5])
-    ax.set_xticklabels(["Low", "Medium", "High"], fontsize=9, color="#5D6D7E")
-    ax.set_yticklabels(["Low", "Medium", "High"], fontsize=9, color="#5D6D7E")
-    ax.set_xlabel("Probability", fontsize=9, color="#7F8C8D", labelpad=8)
-    ax.set_ylabel("Impact", fontsize=9, color="#7F8C8D", labelpad=8)
-    ax.set_title("Risk Heatmap — Probability vs Impact",
-                 fontsize=10, fontweight="bold", color="#1F3864", pad=10)
-    ax.grid(True, linestyle="--", alpha=0.3, color="#BDC3C7")
-    ax.spines["top"].set_visible(False)
-    ax.spines["right"].set_visible(False)
+    ax.set_xticklabels(["Low", "Medium", "High"],
+                       fontsize=10, color="#5D6D7E")
+    ax.set_yticklabels(["Low", "Medium", "High"],
+                       fontsize=10, color="#5D6D7E")
+    ax.set_xlabel("Probability →", fontsize=9,
+                  color="#7F8C8D", labelpad=8)
+    ax.set_ylabel("← Impact", fontsize=9,
+                  color="#7F8C8D", labelpad=8)
+    ax.set_title("Risk Matrix  (★ = Deal Breaker Risk)",
+                 fontsize=10, fontweight="bold",
+                 color="#1F3864", pad=12)
+    ax.grid(True, linestyle=":", alpha=0.4, color="#BDC3C7")
+    for spine in ["top", "right"]:
+        ax.spines[spine].set_visible(False)
+
+    # Legend
+    patches = [
+        mpatches.Patch(color="#C0392B", label="High probability"),
+        mpatches.Patch(color="#D68910", label="Medium probability"),
+        mpatches.Patch(color="#1E8449", label="Low probability"),
+    ]
+    ax.legend(handles=patches, fontsize=7.5,
+              loc="upper left", framealpha=0.85)
 
     plt.tight_layout()
     buf = BytesIO()
-    plt.savefig(buf, format="png", dpi=150, bbox_inches="tight",
-                facecolor=fig.get_facecolor())
+    plt.savefig(buf, format="png", dpi=150,
+                bbox_inches="tight", facecolor="#F7FAFC")
     plt.close(fig)
     buf.seek(0)
     return buf
 
 
-def make_financial_bar(metrics: list) -> BytesIO:
-    """
-    Creates a visual assessment bar chart for financial metrics.
-    Shows Strong / Acceptable / Weak / Not Disclosed status.
-    """
-    assessment_color = {
-        "Strong":       "#1E8449",
-        "Acceptable":   "#D68910",
-        "Weak":         "#C0392B",
-        "Not Disclosed":"#7F8C8D",
+def chart_financials(metrics):
+    rating_color = {
+        "Strong":      "#1E8449",
+        "Acceptable":  "#D68910",
+        "Weak":        "#C0392B",
+        "Not Provided":"#95A5A6",
     }
+    names  = [m.get("metric", "")[:30] for m in metrics[:12]]
+    colors = [rating_color.get(m.get("rating", "Not Provided"),
+                               "#95A5A6") for m in metrics[:12]]
 
-    names  = [m.get("metric", f"Metric {i}")[:28]
-              for i, m in enumerate(metrics[:10])]
-    colors = [assessment_color.get(m.get("assessment", "Not Disclosed"),
-                                   "#7F8C8D") for m in metrics[:10]]
-    values = [1] * len(names)
+    fig, ax = plt.subplots(figsize=(7.5, len(names) * 0.48 + 1.2))
+    fig.patch.set_facecolor("#F7FAFC")
+    ax.set_facecolor("#F7FAFC")
 
-    fig, ax = plt.subplots(figsize=(7, len(names) * 0.52 + 1))
-    fig.patch.set_facecolor("#F8FAFC")
-    ax.set_facecolor("#F8FAFC")
+    bars = ax.barh(names, [1]*len(names), color=colors,
+                   height=0.6, edgecolor="white", linewidth=0.8)
 
-    bars = ax.barh(names, values, color=colors, height=0.6,
-                   edgecolor="white", linewidth=0.5)
-
-    # Labels inside bars
-    for bar, m in zip(bars, metrics[:10]):
-        assessment = m.get("assessment", "Not Disclosed")
-        val        = m.get("reported_value", "N/A")
-        display    = f"  {val}  ({assessment})"
-        ax.text(0.02, bar.get_y() + bar.get_height() / 2,
-                display, va="center", fontsize=8,
+    for bar, m in zip(bars, metrics[:12]):
+        val    = m.get("reported_value", "N/A")[:25]
+        rating = m.get("rating", "N/A")
+        ax.text(0.02,
+                bar.get_y() + bar.get_height() / 2,
+                f"  {val}   [{rating}]",
+                va="center", fontsize=8.5,
                 color="white", fontweight="bold")
 
     ax.set_xlim(0, 1)
     ax.set_xticks([])
-    ax.set_title("Unit Economics Assessment",
-                 fontsize=11, fontweight="bold", color="#1F3864", pad=10)
-    ax.tick_params(colors="#5D6D7E", labelsize=8)
-    ax.spines["top"].set_visible(False)
-    ax.spines["right"].set_visible(False)
-    ax.spines["bottom"].set_visible(False)
+    ax.set_title("Unit Economics Dashboard",
+                 fontsize=11, fontweight="bold",
+                 color="#1F3864", pad=12)
+    ax.tick_params(colors="#34495E", labelsize=8.5)
+    for spine in ["top", "right", "bottom"]:
+        ax.spines[spine].set_visible(False)
 
-    # Legend
-    legend_patches = [
+    patches = [
         mpatches.Patch(color="#1E8449", label="Strong"),
         mpatches.Patch(color="#D68910", label="Acceptable"),
         mpatches.Patch(color="#C0392B", label="Weak"),
-        mpatches.Patch(color="#7F8C8D", label="Not Disclosed"),
+        mpatches.Patch(color="#95A5A6", label="Not Provided"),
     ]
-    ax.legend(handles=legend_patches, loc="lower right",
-              fontsize=7, framealpha=0.8)
+    ax.legend(handles=patches, fontsize=8,
+              loc="lower right", framealpha=0.85)
 
     plt.tight_layout()
     buf = BytesIO()
-    plt.savefig(buf, format="png", dpi=150, bbox_inches="tight",
-                facecolor=fig.get_facecolor())
+    plt.savefig(buf, format="png", dpi=150,
+                bbox_inches="tight", facecolor="#F7FAFC")
     plt.close(fig)
     buf.seek(0)
     return buf
 
-
 # ════════════════════════════════════════════════════════════════════════════
-#  WORD DOCUMENT BUILDER — Professional IC Memo formatting
+#  WORD DOCUMENT BUILDER
 # ════════════════════════════════════════════════════════════════════════════
 
-def hex_to_rgb(hex_color: str):
-    h = hex_color.lstrip("#")
-    return RGBColor(int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16))
+def hex_rgb(h):
+    h = h.lstrip("#")
+    return RGBColor(int(h[0:2],16), int(h[2:4],16), int(h[4:6],16))
 
-
-def set_cell_bg(cell, hex_color: str):
-    tc   = cell._tc
+def cell_bg(cell, color):
+    tc = cell._tc
     tcPr = tc.get_or_add_tcPr()
-    shd  = OxmlElement("w:shd")
+    shd = OxmlElement("w:shd")
     shd.set(qn("w:val"),   "clear")
     shd.set(qn("w:color"), "auto")
-    shd.set(qn("w:fill"),  hex_color.lstrip("#"))
+    shd.set(qn("w:fill"),  color.lstrip("#"))
     tcPr.append(shd)
 
-
-def set_cell_margins(cell, top=80, bottom=80, left=120, right=120):
-    tc   = cell._tc
+def cell_pad(cell, t=80, b=80, l=120, r=120):
+    tc = cell._tc
     tcPr = tc.get_or_add_tcPr()
     tcMar = OxmlElement("w:tcMar")
-    for side, val in [("top", top), ("bottom", bottom),
-                      ("left", left), ("right", right)]:
+    for side, val in [("top",t),("bottom",b),("left",l),("right",r)]:
         el = OxmlElement(f"w:{side}")
         el.set(qn("w:w"),    str(val))
         el.set(qn("w:type"), "dxa")
         tcMar.append(el)
     tcPr.append(tcMar)
 
-
-def add_section_heading(doc, text: str, level: int = 1):
-    """Add a styled section heading with a coloured bottom border."""
-    para = doc.add_paragraph()
-    para.paragraph_format.space_before = Pt(14)
-    para.paragraph_format.space_after  = Pt(4)
-    run  = para.add_run(text.upper())
-    run.bold = True
-    run.font.size  = Pt(11) if level == 1 else Pt(10)
-    run.font.color.rgb = hex_to_rgb(NAVY)
-    run.font.name  = "Calibri"
-
-    # Bottom border line under heading
-    pPr = para._p.get_or_add_pPr()
+def section_head(doc, text):
+    p = doc.add_paragraph()
+    p.paragraph_format.space_before = Pt(16)
+    p.paragraph_format.space_after  = Pt(3)
+    r = p.add_run(text.upper())
+    r.bold = True
+    r.font.size  = Pt(11)
+    r.font.color.rgb = hex_rgb(NAVY)
+    r.font.name  = "Calibri"
+    pPr  = p._p.get_or_add_pPr()
     pBdr = OxmlElement("w:pBdr")
-    bottom = OxmlElement("w:bottom")
-    bottom.set(qn("w:val"),   "single")
-    bottom.set(qn("w:sz"),    "6")
-    bottom.set(qn("w:space"), "1")
-    bottom.set(qn("w:color"), MID_BLUE)
-    pBdr.append(bottom)
+    bot  = OxmlElement("w:bottom")
+    bot.set(qn("w:val"),   "single")
+    bot.set(qn("w:sz"),    "8")
+    bot.set(qn("w:space"), "2")
+    bot.set(qn("w:color"), MID_BLUE)
+    pBdr.append(bot)
     pPr.append(pBdr)
-    return para
 
+def body(doc, text):
+    p = doc.add_paragraph(text)
+    p.paragraph_format.space_after  = Pt(6)
+    p.paragraph_format.space_before = Pt(2)
+    for r in p.runs:
+        r.font.size = Pt(10)
+        r.font.name = "Calibri"
 
-def add_body_text(doc, text: str):
-    """Add a styled body paragraph."""
-    para = doc.add_paragraph(text)
-    para.paragraph_format.space_after  = Pt(6)
-    para.paragraph_format.space_before = Pt(2)
-    for run in para.runs:
-        run.font.size = Pt(10)
-        run.font.name = "Calibri"
-    return para
+def styled_table(doc, headers, rows, alt_color=LIGHT_BLUE):
+    t = doc.add_table(rows=1, cols=len(headers))
+    t.style = "Table Grid"
+    t.alignment = WD_TABLE_ALIGNMENT.LEFT
 
+    # Header
+    for i, h in enumerate(headers):
+        c = t.rows[0].cells[i]
+        cell_bg(c, DARK_BLUE)
+        cell_pad(c)
+        c.paragraphs[0].clear()
+        r = c.paragraphs[0].add_run(h)
+        r.bold = True
+        r.font.size  = Pt(8.5)
+        r.font.color.rgb = hex_rgb(WHITE)
+        r.font.name  = "Calibri"
+        c.paragraphs[0].alignment = WD_ALIGN_PARAGRAPH.CENTER
 
-def add_styled_table(doc, headers: list, rows: list,
-                     col_widths: list = None,
-                     stripe_color: str = LIGHT_BLUE):
-    """
-    Add a fully styled table with:
-    - Dark blue header row (white text)
-    - Alternating row shading
-    - Proper cell padding
-    - Consistent font
-    """
-    n_cols = len(headers)
-    table  = doc.add_table(rows=1, cols=n_cols)
-    table.style = "Table Grid"
-    table.alignment = WD_TABLE_ALIGNMENT.CENTER
+    risk_colors = {
+        "High": RED, "Medium": AMBER, "Low": GREEN,
+        "Strong": GREEN, "Acceptable": AMBER, "Weak": RED,
+        "Not Provided": GREY, "Not Disclosed": GREY,
+        "Green": GREEN, "Yellow": AMBER, "Red": RED,
+        "Yes": RED, "No": GREEN,
+        "Primary": GREEN, "Secondary": AMBER, "None": GREY,
+        "Subject": MID_BLUE,
+    }
 
-    # Set column widths (in DXA — 1440 DXA = 1 inch)
-    if col_widths:
-        for i, width in enumerate(col_widths):
-            for cell in table.columns[i].cells:
-                cell.width = Pt(width) * 20  # approximate
-
-    # Header row
-    hdr_cells = table.rows[0].cells
-    for i, header in enumerate(headers):
-        cell = hdr_cells[i]
-        set_cell_bg(cell, DARK_BLUE)
-        set_cell_margins(cell)
-        para = cell.paragraphs[0]
-        para.clear()
-        run = para.add_run(header)
-        run.bold = True
-        run.font.size  = Pt(9)
-        run.font.color.rgb = hex_to_rgb(WHITE)
-        run.font.name  = "Calibri"
-        para.alignment = WD_ALIGN_PARAGRAPH.CENTER
-
-    # Data rows
-    for row_idx, row_data in enumerate(rows):
-        row = table.add_row()
-        bg  = stripe_color if row_idx % 2 == 0 else WHITE
-        for col_idx, value in enumerate(row_data):
-            cell = row.cells[col_idx]
-            # Override bg for color-coded cells
-            if isinstance(value, tuple):
-                text, override_color = value
-                set_cell_bg(cell, override_color)
-                set_cell_margins(cell)
-                para = cell.paragraphs[0]
-                para.clear()
-                run  = para.add_run(str(text))
-                run.bold = True
-                run.font.size  = Pt(9)
-                run.font.color.rgb = hex_to_rgb(WHITE)
-                run.font.name  = "Calibri"
-                para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    for ri, row_vals in enumerate(rows):
+        row = t.add_row()
+        bg  = alt_color if ri % 2 == 0 else WHITE
+        for ci, val in enumerate(row_vals):
+            c = row.cells[ci]
+            cell_pad(c)
+            if isinstance(val, tuple):
+                text_val, override = val
+                cell_bg(c, override)
+                c.paragraphs[0].clear()
+                r = c.paragraphs[0].add_run(str(text_val))
+                r.bold = True
+                r.font.size  = Pt(8.5)
+                r.font.color.rgb = hex_rgb(WHITE)
+                r.font.name  = "Calibri"
+                c.paragraphs[0].alignment = WD_ALIGN_PARAGRAPH.CENTER
             else:
-                set_cell_bg(cell, bg)
-                set_cell_margins(cell)
-                para = cell.paragraphs[0]
-                para.clear()
-                run  = para.add_run(str(value))
-                run.font.size = Pt(9)
-                run.font.name = "Calibri"
-
-    doc.add_paragraph()
-    return table
-
-
-def color_for_level(level: str, invert: bool = False) -> str:
-    """Return hex color for High/Medium/Low risk levels."""
-    mapping = {"High": RED, "Medium": AMBER, "Low": GREEN}
-    return mapping.get(level, GREY)
-
-
-def embed_chart(doc, chart_buf: BytesIO, width_inches: float = 6.0):
-    """Embed a matplotlib chart PNG into the Word document."""
-    doc.add_picture(chart_buf, width=Inches(width_inches))
-    last_para = doc.paragraphs[-1]
-    last_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                sv = str(val)
+                override = risk_colors.get(sv)
+                if override:
+                    cell_bg(c, override)
+                    c.paragraphs[0].clear()
+                    r2 = c.paragraphs[0].add_run(sv)
+                    r2.bold = True
+                    r2.font.size  = Pt(8.5)
+                    r2.font.color.rgb = hex_rgb(WHITE)
+                    r2.font.name  = "Calibri"
+                    c.paragraphs[0].alignment = WD_ALIGN_PARAGRAPH.CENTER
+                else:
+                    cell_bg(c, bg)
+                    c.paragraphs[0].clear()
+                    r2 = c.paragraphs[0].add_run(sv)
+                    r2.font.size = Pt(8.5)
+                    r2.font.name = "Calibri"
     doc.add_paragraph()
 
+def embed_img(doc, buf, width=6.0, caption=None):
+    buf.seek(0)
+    doc.add_picture(buf, width=Inches(width))
+    doc.paragraphs[-1].alignment = WD_ALIGN_PARAGRAPH.CENTER
+    if caption:
+        cp = doc.add_paragraph(caption)
+        cp.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        cp.runs[0].font.size  = Pt(8)
+        cp.runs[0].font.color.rgb = hex_rgb(GREY)
+        cp.runs[0].font.name  = "Calibri"
+    doc.add_paragraph()
 
-def build_word_memo(text_sections: dict, table_data: dict,
-                    company: str, fund_type: str) -> BytesIO:
+
+def build_memo(texts, tables, charts, company, fund_type):
     doc = Document()
+    sec = doc.sections[0]
+    sec.top_margin    = Inches(0.85)
+    sec.bottom_margin = Inches(0.85)
+    sec.left_margin   = Inches(1.0)
+    sec.right_margin  = Inches(1.0)
 
-    # ── Page setup ───────────────────────────────────────────────────────────
-    section = doc.sections[0]
-    section.top_margin    = Inches(0.9)
-    section.bottom_margin = Inches(0.9)
-    section.left_margin   = Inches(1.0)
-    section.right_margin  = Inches(1.0)
+    # ── Cover ──────────────────────────────────────────────────────────────
+    p = doc.add_paragraph()
+    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    r = p.add_run("STRICTLY CONFIDENTIAL  ·  FOR IC USE ONLY")
+    r.font.size  = Pt(8); r.font.color.rgb = hex_rgb(GREY)
+    r.font.name  = "Calibri"
 
-    # ── Cover header strip ───────────────────────────────────────────────────
-    # Confidential banner
-    conf = doc.add_paragraph()
-    conf.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    conf.paragraph_format.space_before = Pt(0)
-    conf.paragraph_format.space_after  = Pt(4)
-    conf_run = conf.add_run("STRICTLY CONFIDENTIAL — FOR IC USE ONLY")
-    conf_run.font.size  = Pt(8)
-    conf_run.font.name  = "Calibri"
-    conf_run.font.color.rgb = hex_to_rgb(GREY)
+    p = doc.add_paragraph()
+    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    r = p.add_run("INVESTMENT COMMITTEE MEMORANDUM")
+    r.bold = True; r.font.size = Pt(20)
+    r.font.color.rgb = hex_rgb(NAVY); r.font.name = "Calibri"
 
-    # Main title
-    title = doc.add_paragraph()
-    title.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    title_run = title.add_run("INVESTMENT COMMITTEE MEMORANDUM")
-    title_run.bold = True
-    title_run.font.size  = Pt(18)
-    title_run.font.name  = "Calibri"
-    title_run.font.color.rgb = hex_to_rgb(NAVY)
-
-    # Company name
-    co_para = doc.add_paragraph()
-    co_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    co_run = co_para.add_run(company.upper())
-    co_run.bold = True
-    co_run.font.size  = Pt(15)
-    co_run.font.name  = "Calibri"
-    co_run.font.color.rgb = hex_to_rgb(MID_BLUE)
+    p = doc.add_paragraph()
+    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    r = p.add_run(company.upper())
+    r.bold = True; r.font.size = Pt(16)
+    r.font.color.rgb = hex_rgb(MID_BLUE); r.font.name = "Calibri"
 
     doc.add_paragraph()
+    meta = doc.add_table(rows=4, cols=2)
+    meta.style = "Table Grid"
+    for i, (k, v) in enumerate([
+        ("Fund Format",      fund_type),
+        ("Classification",   "Confidential — Investment Committee Only"),
+        ("Analysis Stage",   "First-Pass — Full Diligence Pending"),
+        ("Prepared By",      "DealMemo AI  |  Analyst-Grade First Draft"),
+    ]):
+        meta.cell(i,0).text = k
+        meta.cell(i,1).text = v
+        cell_bg(meta.cell(i,0), LIGHT_BLUE)
+        cell_pad(meta.cell(i,0)); cell_pad(meta.cell(i,1))
+        meta.cell(i,0).paragraphs[0].runs[0].bold = True
+        for c in [meta.cell(i,0), meta.cell(i,1)]:
+            for r2 in c.paragraphs[0].runs:
+                r2.font.size = Pt(9); r2.font.name = "Calibri"
 
-    # Metadata table
-    meta_rows = [
-        ["Memo Type",       fund_type],
-        ["Classification",  "Confidential — Investment Committee Only"],
-        ["Prepared By",     "DealMemo AI  |  Senior Analyst Review"],
-        ["Status",          "First-Pass Analysis — Full Diligence Pending"],
-    ]
-    meta_table = doc.add_table(rows=len(meta_rows), cols=2)
-    meta_table.style = "Table Grid"
-    for i, (label, value) in enumerate(meta_rows):
-        meta_table.cell(i, 0).text = label
-        meta_table.cell(i, 1).text = value
-        set_cell_bg(meta_table.cell(i, 0), LIGHT_BLUE)
-        set_cell_margins(meta_table.cell(i, 0))
-        set_cell_margins(meta_table.cell(i, 1))
-        for run in meta_table.cell(i, 0).paragraphs[0].runs:
-            run.bold = True
-            run.font.size = Pt(9)
-            run.font.name = "Calibri"
-        for run in meta_table.cell(i, 1).paragraphs[0].runs:
-            run.font.size = Pt(9)
-            run.font.name = "Calibri"
-
-    doc.add_paragraph()
     doc.add_page_break()
 
-    # ── SECTION 1: Executive Summary ─────────────────────────────────────────
-    add_section_heading(doc, "1. Executive Summary & Investment Thesis")
-    add_body_text(doc, text_sections.get("executive_summary", ""))
+    # ── 1. Executive Summary ───────────────────────────────────────────────
+    section_head(doc, "1.  Executive Summary & Investment Thesis")
+    body(doc, texts.get("exec", ""))
     doc.add_paragraph()
 
-    # ── SECTION 2: Company Overview ──────────────────────────────────────────
-    add_section_heading(doc, "2. Company Overview & Business Model")
-    add_body_text(doc, text_sections.get("company_overview", ""))
+    # ── 2. Company Overview ────────────────────────────────────────────────
+    section_head(doc, "2.  Company Overview & Business Model")
+    body(doc, texts.get("overview", ""))
     doc.add_paragraph()
 
-    # ── SECTION 3: Market Opportunity ────────────────────────────────────────
-    add_section_heading(doc, "3. Market Opportunity")
-    add_body_text(doc, text_sections.get("market_opportunity", ""))
+    # ── 3. Market Opportunity ──────────────────────────────────────────────
+    section_head(doc, "3.  Market Opportunity")
+    body(doc, texts.get("market", ""))
+    if "tam" in charts:
+        doc.add_paragraph()
+        embed_img(doc, charts["tam"], 5.5,
+                  "Exhibit 1: TAM / SAM / SOM Sizing (INR Crores)")
+
+    # ── 4. Competitive Landscape ───────────────────────────────────────────
+    section_head(doc, "4.  Competitive Landscape")
+    comp = tables.get("competitive", {})
+    rows_c = comp.get("rows", [])
+    if rows_c:
+        hdrs = ["Company", "Stage", "Funding", "Core Product",
+                "Rev Model", "India", "Moat",
+                "Weakness", "Threat"]
+        data = []
+        for r in rows_c:
+            data.append([
+                r.get("company",""),
+                r.get("stage",""),
+                r.get("funding_raised",""),
+                r.get("core_product",""),
+                r.get("revenue_model",""),
+                r.get("india_focus",""),
+                r.get("moat",""),
+                r.get("weakness",""),
+                r.get("threat_to_subject",""),
+            ])
+        styled_table(doc, hdrs, data)
+    summary_c = comp.get("competitive_summary","")
+    if summary_c:
+        body(doc, f"Analyst View: {summary_c}")
     doc.add_paragraph()
 
-    # TAM Chart
-    if "tam_chart" in table_data:
-        embed_chart(doc, table_data["tam_chart"], width_inches=5.5)
-
-    # ── SECTION 4: Competitive Landscape ─────────────────────────────────────
-    add_section_heading(doc, "4. Competitive Landscape")
-    comp_data = table_data.get("competitive", {})
-    comp_rows_raw = comp_data.get("rows", [])
-
-    if comp_rows_raw:
-        headers = ["Company", "Founded", "Funding",
-                   "Product Focus", "Business Model",
-                   "India Presence", "Key Strength",
-                   "Key Weakness", "Threat"]
-        rows = []
-        for r in comp_rows_raw:
-            threat = r.get("threat_level", "Medium")
-            rows.append([
-                r.get("company", ""),
-                r.get("founded", "N/A"),
-                r.get("funding", "N/A"),
-                r.get("product_focus", ""),
-                r.get("business_model", ""),
-                r.get("india_presence", ""),
-                r.get("key_strength", ""),
-                r.get("key_weakness", ""),
-                (threat, color_for_level(threat)),
+    # ── 5. Team Assessment ─────────────────────────────────────────────────
+    section_head(doc, "5.  Team Assessment")
+    team = tables.get("team", {})
+    members = team.get("members", [])
+    if members:
+        hdrs = ["Name","Title","Prior Employer",
+                "Prior Role","Yrs Exp",
+                "Relevance","Education","Flag"]
+        data = []
+        for m in members:
+            data.append([
+                m.get("name",""),
+                m.get("title",""),
+                m.get("previous_employer",""),
+                m.get("previous_role",""),
+                m.get("years_experience",""),
+                m.get("direct_relevance",""),
+                m.get("education",""),
+                m.get("flag",""),
             ])
-        add_styled_table(doc, headers, rows)
+        styled_table(doc, hdrs, data)
+    for field, label in [
+        ("team_verdict",     "Team Assessment"),
+        ("missing_hires",    "Missing Hires"),
+        ("founder_risk_reason","Founder Risk"),
+    ]:
+        val = team.get(field, "")
+        if val:
+            body(doc, f"{label}: {val}")
+    doc.add_paragraph()
 
-    # ── SECTION 5: Team Assessment ───────────────────────────────────────────
-    add_section_heading(doc, "5. Team Assessment")
-    team_data = table_data.get("team", {})
-    team_rows_raw = team_data.get("rows", [])
-    team_summary  = team_data.get("team_summary", "")
-    missing_roles = team_data.get("missing_roles", "")
-
-    if team_rows_raw:
-        headers = ["Name", "Title", "Prior Company",
-                   "Prior Role", "Relevant Experience",
-                   "Education", "Assessment"]
-        rows = []
-        for r in team_rows_raw:
-            flag = r.get("flag", "Yellow")
-            rows.append([
-                r.get("name", ""),
-                r.get("title", ""),
-                r.get("prior_company", ""),
-                r.get("prior_role", ""),
-                r.get("relevant_experience", ""),
-                r.get("education", ""),
-                (flag, color_for_level(
-                    "Low" if flag == "Green"
-                    else "Medium" if flag == "Yellow"
-                    else "High"
-                )),
+    # ── 6. Unit Economics ──────────────────────────────────────────────────
+    section_head(doc, "6.  Unit Economics & Financial Analysis")
+    fin = tables.get("financials", {})
+    metrics = fin.get("metrics", [])
+    if metrics:
+        hdrs = ["Metric","Reported Value",
+                "Analyst Comment","India Benchmark","Rating"]
+        data = []
+        for m in metrics:
+            data.append([
+                m.get("metric",""),
+                m.get("reported_value",""),
+                m.get("analyst_comment",""),
+                m.get("india_benchmark",""),
+                m.get("rating",""),
             ])
-        add_styled_table(doc, headers, rows)
+        styled_table(doc, hdrs, data)
+    if "fin" in charts:
+        embed_img(doc, charts["fin"], 6.5,
+                  "Exhibit 2: Unit Economics Assessment Dashboard")
+    for field, label in [
+        ("headline_positive",    "Key Positive"),
+        ("headline_concern",     "Key Concern ⚠"),
+        ("burn_runway_comment",  "Burn & Runway"),
+    ]:
+        val = fin.get(field, "")
+        if val:
+            body(doc, f"{label}: {val}")
+    doc.add_paragraph()
 
-    if team_summary:
-        add_body_text(doc, f"Team Summary: {team_summary}")
-    if missing_roles:
-        add_body_text(doc, f"Missing Roles: {missing_roles}")
-
-    # ── SECTION 6: Unit Economics & Financials ───────────────────────────────
-    add_section_heading(doc, "6. Unit Economics & Financial Analysis")
-    fin_data    = table_data.get("financials", {})
-    metrics_raw = fin_data.get("metrics", [])
-    fin_summary = fin_data.get("financial_summary", "")
-    key_concern = fin_data.get("key_concern", "")
-
-    if metrics_raw:
-        headers = ["Metric", "Reported Value",
-                   "Analyst Note", "India Benchmark", "Assessment"]
-        rows = []
-        for m in metrics_raw:
-            assessment = m.get("assessment", "Not Disclosed")
-            color_map  = {
-                "Strong":       GREEN,
-                "Acceptable":   AMBER,
-                "Weak":         RED,
-                "Not Disclosed": GREY,
-            }
-            rows.append([
-                m.get("metric", ""),
-                m.get("reported_value", "N/A"),
-                m.get("analyst_note", ""),
-                m.get("india_benchmark", ""),
-                (assessment, color_map.get(assessment, GREY)),
+    # ── 7. Key Risks ────────────────────────────────────────────────────────
+    section_head(doc, "7.  Key Risks & Mitigants")
+    risk = tables.get("risks", {})
+    risk_rows = risk.get("risks", [])
+    if risk_rows:
+        hdrs = ["ID","Category","Risk","Description",
+                "Prob","Impact","Time","Mitigant",
+                "Residual","Deal Breaker"]
+        data = []
+        for r in risk_rows:
+            data.append([
+                r.get("id",""),
+                r.get("category",""),
+                r.get("title",""),
+                r.get("description",""),
+                r.get("probability",""),
+                r.get("impact",""),
+                r.get("time_horizon",""),
+                r.get("mitigant",""),
+                r.get("residual_risk",""),
+                r.get("deal_breaker",""),
             ])
-        add_styled_table(doc, headers, rows)
+        styled_table(doc, hdrs, data)
+    if "risk" in charts:
+        embed_img(doc, charts["risk"], 5.5,
+                  "Exhibit 3: Risk Matrix — Probability vs Impact")
+    rs = risk.get("risk_summary","")
+    if rs:
+        body(doc, f"Risk Summary: {rs}")
+    doc.add_paragraph()
 
-    # Financial assessment chart
-    if metrics_raw and "fin_chart" in table_data:
-        embed_chart(doc, table_data["fin_chart"], width_inches=6.0)
-
-    if fin_summary:
-        add_body_text(doc, f"Financial Assessment: {fin_summary}")
-    if key_concern:
-        add_body_text(doc, f"⚠  Key Concern: {key_concern}")
-
-    # ── SECTION 7: Key Risks ──────────────────────────────────────────────────
-    add_section_heading(doc, "7. Key Risks & Mitigants")
-    risk_data    = table_data.get("risks", {})
-    risk_rows_raw = risk_data.get("rows", [])
-    risk_summary  = risk_data.get("risk_summary", "")
-
-    if risk_rows_raw:
-        headers = ["Category", "Risk", "Description",
-                   "Probability", "Impact",
-                   "Time Horizon", "Mitigant", "Residual Risk"]
-        rows = []
-        for r in risk_rows_raw:
-            prob    = r.get("probability", "Medium")
-            impact  = r.get("impact", "Medium")
-            residual = r.get("residual_risk", "Medium")
-            rows.append([
-                r.get("risk_category", ""),
-                r.get("risk_title", ""),
-                r.get("risk_description", ""),
-                (prob,     color_for_level(prob)),
-                (impact,   color_for_level(impact)),
-                r.get("time_horizon", ""),
-                r.get("mitigant", ""),
-                (residual, color_for_level(residual)),
-            ])
-        add_styled_table(doc, headers, rows)
-
-    # Risk heatmap chart
-    if risk_rows_raw and "risk_chart" in table_data:
-        embed_chart(doc, table_data["risk_chart"], width_inches=5.0)
-
-    if risk_summary:
-        add_body_text(doc, f"Risk Summary: {risk_summary}")
-
-    # ── SECTION 8: Investment Recommendation ──────────────────────────────────
+    # ── 8. Investment Recommendation ────────────────────────────────────────
     doc.add_page_break()
-    add_section_heading(doc, "8. Investment Recommendation")
-    add_body_text(doc, text_sections.get("recommendation", ""))
+    section_head(doc, "8.  Investment Recommendation")
+    body(doc, texts.get("recommendation", ""))
 
-    # ── Footer disclaimer ─────────────────────────────────────────────────────
+    # ── Disclaimer ─────────────────────────────────────────────────────────
     doc.add_paragraph()
-    disc_para = doc.add_paragraph()
-    disc_para.paragraph_format.space_before = Pt(12)
-    line = disc_para.add_run("─" * 90)
-    line.font.color.rgb = hex_to_rgb(GREY)
-    line.font.size = Pt(8)
-
-    disclaimer = doc.add_paragraph()
-    d_run = disclaimer.add_run(
+    p = doc.add_paragraph("─" * 95)
+    p.runs[0].font.size  = Pt(8)
+    p.runs[0].font.color.rgb = hex_rgb(GREY)
+    disc = doc.add_paragraph(
         "DISCLAIMER: This memorandum was prepared using DealMemo AI as a "
         "first-draft analytical tool. All figures, assessments, and "
         "recommendations must be independently verified by a qualified "
         "investment professional before any capital commitment. This "
         "document does not constitute financial advice or a solicitation "
-        "to invest. Past performance of comparable companies is not "
-        "indicative of future results."
+        "to invest."
     )
-    d_run.font.size  = Pt(8)
-    d_run.font.color.rgb = hex_to_rgb(GREY)
-    d_run.font.name  = "Calibri"
+    disc.runs[0].font.size  = Pt(8)
+    disc.runs[0].font.color.rgb = hex_rgb(GREY)
+    disc.runs[0].font.name  = "Calibri"
 
-    # ── Save ──────────────────────────────────────────────────────────────────
     buf = BytesIO()
     doc.save(buf)
     buf.seek(0)
     return buf
-
-
-# ════════════════════════════════════════════════════════════════════════════
-#  TAM DATA EXTRACTION — Used to power the market chart
-# ════════════════════════════════════════════════════════════════════════════
-
-def extract_tam_data(deck: str, company: str) -> dict:
-    """Extract TAM/SAM/SOM figures from deck text for chart generation."""
-    result = safe_ai_call(
-        messages=[
-            {"role": "system",
-             "content": "You are a JSON data extractor. Return only valid JSON."},
-            {"role": "user", "content": f"""
-Extract or estimate TAM, SAM, SOM figures for {company} from this deck.
-Return ONLY this JSON (no text, no markdown):
-
-{{
-  "tam_inr": <number in INR Crores, integer only>,
-  "sam_inr": <number in INR Crores, integer only>,
-  "som_inr": <number in INR Crores, integer only>
-}}
-
-If not explicitly stated, use your analyst knowledge to estimate.
-SAM must be less than TAM. SOM must be less than SAM.
-
-Deck content:
-{deck[:2000]}
-"""}
-        ],
-        expect_json=True,
-        max_tokens=120
-    )
-    try:
-        data = json.loads(result)
-        # Sanity check
-        if data.get("tam_inr", 0) > 0:
-            return data
-    except Exception:
-        pass
-    return {"tam_inr": 50000, "sam_inr": 12000, "som_inr": 2500}
-
 
 # ════════════════════════════════════════════════════════════════════════════
 #  STREAMLIT UI
@@ -1120,366 +1040,230 @@ st.set_page_config(
     initial_sidebar_state="collapsed"
 )
 
-# Custom CSS for cleaner UI
 st.markdown("""
 <style>
-    .main { max-width: 1100px; }
-    .stButton button {
-        background-color: #1F4E79;
-        color: white;
-        font-weight: 600;
-        border-radius: 4px;
-        border: none;
-        padding: 0.6rem 1.2rem;
-    }
-    .stButton button:hover { background-color: #2E75B6; }
-    .metric-box {
-        background: #F0F4F8;
-        border-left: 4px solid #1F4E79;
-        padding: 12px 16px;
-        border-radius: 4px;
-        margin: 8px 0;
-    }
-    h1 { color: #1F3864 !important; }
-    h2 { color: #1F4E79 !important; }
+.stButton button {
+    background-color: #1F4E79;
+    color: white;
+    font-weight: 600;
+    border-radius: 4px;
+    border: none;
+}
+.stButton button:hover { background-color: #2E75B6; }
 </style>
 """, unsafe_allow_html=True)
 
-# Header
 st.title("📋 DealMemo AI")
 st.subheader("Professional IC Memo Generator — Indian Startup Ecosystem")
 st.markdown(
-    "Upload a pitch deck and get a **full Investment Committee memo** — "
-    "with tables, charts, and structured analysis — calibrated for "
-    "Indian funds."
+    "Upload a pitch deck → get a **full Investment Committee memo** "
+    "with tables, charts, and analyst-grade commentary in ~4 minutes."
 )
-
 st.divider()
 
-# Input area
-col1, col2 = st.columns([1, 1])
-
+col1, col2 = st.columns(2)
 with col1:
-    company = st.text_input(
-        "Company Name",
-        placeholder="e.g. Zomato, Groww, YourStartup",
-        help="Enter the exact company name as it appears in the deck."
-    )
-    fund_type = st.selectbox(
-        "Memo Format",
-        ["Angel Syndicate",
-         "Category 1 AIF",
-         "Category 2 AIF",
-         "Family Office",
-         "Micro VC Fund",
-         "PE / Growth Equity"]
-    )
-
+    company   = st.text_input("Company Name",
+                              placeholder="e.g. Zomato, Groww, YourStartup")
+    fund_type = st.selectbox("Memo Format", [
+        "Angel Syndicate", "Category 1 AIF", "Category 2 AIF",
+        "Family Office", "Micro VC Fund", "PE / Growth Equity"
+    ])
 with col2:
-    pdf_file = st.file_uploader(
-        "Upload Pitch Deck (PDF)",
-        type=["pdf"],
-        help="Upload the startup's pitch deck as a PDF file."
-    )
+    pdf_file = st.file_uploader("Upload Pitch Deck (PDF)", type=["pdf"])
     if pdf_file:
-        st.success(f"✅ Uploaded: {pdf_file.name}")
-    st.caption(
-        "🔒 Your deck is never stored or shared. "
-        "It is processed in memory only."
-    )
+        st.success(f"✅ {pdf_file.name} uploaded")
+    st.caption("🔒 Deck is processed in memory only. Never stored.")
 
 st.divider()
 
-# What gets generated info
-with st.expander("📄 What this memo includes", expanded=False):
-    st.markdown("""
-    **8 Sections:**
-    1. Executive Summary & Investment Thesis
-    2. Company Overview & Business Model
-    3. Market Opportunity (with TAM/SAM/SOM chart)
-    4. Competitive Landscape (colour-coded comparison matrix)
-    5. Team Assessment (with Green/Yellow/Red flags)
-    6. Unit Economics & Financial Analysis (with visual assessment)
-    7. Key Risks & Mitigants (with risk heatmap)
-    8. Investment Recommendation (with bull/bear case)
-
-    **Output:** Professional Word document (.docx) ready for IC presentation.
-    """)
-
-# Generate button
-generate = st.button(
-    "🚀 Generate IC Memo",
-    type="primary",
-    use_container_width=True
-)
-
-if generate:
+if st.button("🚀 Generate IC Memo", type="primary",
+             use_container_width=True):
     if not company:
-        st.error("⚠️ Please enter the company name.")
+        st.error("Please enter the company name.")
     elif not pdf_file:
-        st.error("⚠️ Please upload a pitch deck PDF.")
-    elif not GROQ_API_KEY:
-        st.error("⚠️ API key not configured. Contact support.")
+        st.error("Please upload a pitch deck PDF.")
     else:
-        # Extract PDF
-        deck_text = extract_pdf_text(pdf_file)
-
-        if not deck_text.strip():
+        deck = extract_pdf_text(pdf_file)
+        if not deck.strip():
             st.error(
-                "❌ Could not extract text from this PDF. "
-                "Please ensure it is not a scanned image-only PDF. "
-                "Try copy-pasting text from the PDF to verify."
+                "Could not extract text. Ensure it is not a "
+                "scanned image-only PDF."
             )
-        else:
-            st.info(
-                f"⚡ Generating IC memo for **{company}**... "
-                "Takes about 3-4 minutes. Do not close this tab."
-            )
+            st.stop()
 
-            # Progress tracking
-            progress  = st.progress(0)
-            status    = st.empty()
-            TOTAL_STEPS = 11  # 4 text + 4 tables + 3 charts
+        bar    = st.progress(0)
+        status = st.empty()
+        STEPS  = 12
+        step   = [0]
 
-            text_sections = {}
-            table_data    = {}
-            step = 0
+        def tick(msg):
+            step[0] += 1
+            bar.progress(min(step[0]/STEPS, 1.0))
+            status.text(msg)
 
-            def tick(msg):
-                global step
-                step += 1
-                progress.progress(min(step / TOTAL_STEPS, 1.0))
-                status.text(msg)
+        texts  = {}
+        tables = {}
+        charts = {}
 
-            # ── Text Sections ─────────────────────────────────────────────
-            tick("✍️  Writing Executive Summary...")
-            text_sections["executive_summary"] = safe_ai_call(
-                messages=[
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user",
-                     "content": prompt_executive_summary(
-                         deck_text, company, fund_type)}
-                ],
-                max_tokens=1000
-            )
-            time.sleep(3)
+        # ── Text sections ────────────────────────────────────────────────
+        tick("✍️  Writing Executive Summary...")
+        texts["exec"] = safe_ai_call([
+            {"role":"system","content":SYSTEM},
+            {"role":"user","content":prompt_exec_summary(deck,company,fund_type)}
+        ], max_tokens=1100)
+        time.sleep(3)
 
-            tick("✍️  Writing Company Overview...")
-            text_sections["company_overview"] = safe_ai_call(
-                messages=[
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user",
-                     "content": prompt_company_overview(
-                         deck_text, company, fund_type)}
-                ],
-                max_tokens=900
-            )
-            time.sleep(3)
+        tick("✍️  Writing Company Overview...")
+        texts["overview"] = safe_ai_call([
+            {"role":"system","content":SYSTEM},
+            {"role":"user","content":prompt_company_overview(deck,company,fund_type)}
+        ], max_tokens=1000)
+        time.sleep(3)
 
-            tick("✍️  Writing Market Opportunity...")
-            text_sections["market_opportunity"] = safe_ai_call(
-                messages=[
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user",
-                     "content": prompt_market_opportunity(
-                         deck_text, company, fund_type)}
-                ],
-                max_tokens=900
-            )
-            time.sleep(3)
+        tick("✍️  Writing Market Opportunity...")
+        texts["market"] = safe_ai_call([
+            {"role":"system","content":SYSTEM},
+            {"role":"user","content":prompt_market_opp(deck,company,fund_type)}
+        ], max_tokens=1000)
+        time.sleep(3)
 
-            tick("✍️  Writing Investment Recommendation...")
-            text_sections["recommendation"] = safe_ai_call(
-                messages=[
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user",
-                     "content": prompt_investment_recommendation(
-                         deck_text, company, fund_type)}
-                ],
-                max_tokens=1000
-            )
-            time.sleep(3)
+        tick("✍️  Writing Investment Recommendation...")
+        texts["recommendation"] = safe_ai_call([
+            {"role":"system","content":SYSTEM},
+            {"role":"user","content":prompt_recommendation(deck,company,fund_type)}
+        ], max_tokens=1100)
+        time.sleep(3)
 
-            # ── Table Sections ────────────────────────────────────────────
-            tick("📊 Building Competitive Matrix...")
-            raw = safe_ai_call(
-                messages=[
-                    {"role": "system",
-                     "content": "You output only valid JSON. No text."},
-                    {"role": "user",
-                     "content": prompt_competitive_table(deck_text, company)}
-                ],
-                expect_json=True,
-                max_tokens=1200
-            )
-            try:
-                table_data["competitive"] = json.loads(raw)
-            except Exception:
-                table_data["competitive"] = {"rows": []}
-            time.sleep(3)
+        # ── Table sections ───────────────────────────────────────────────
+        tick("📊 Competitive Matrix...")
+        raw = safe_ai_call([
+            {"role":"system","content":"Return only valid JSON. No text."},
+            {"role":"user","content":prompt_competitive(deck,company)}
+        ], expect_json=True, max_tokens=1400)
+        try: tables["competitive"] = json.loads(raw)
+        except Exception: tables["competitive"] = {"rows":[]}
+        time.sleep(3)
 
-            tick("👥 Building Team Assessment Table...")
-            raw = safe_ai_call(
-                messages=[
-                    {"role": "system",
-                     "content": "You output only valid JSON. No text."},
-                    {"role": "user",
-                     "content": prompt_team_table(deck_text, company)}
-                ],
-                expect_json=True,
-                max_tokens=1200
-            )
-            try:
-                table_data["team"] = json.loads(raw)
-            except Exception:
-                table_data["team"] = {"rows": []}
-            time.sleep(3)
+        tick("👥 Team Assessment...")
+        raw = safe_ai_call([
+            {"role":"system","content":"Return only valid JSON. No text."},
+            {"role":"user","content":prompt_team(deck,company)}
+        ], expect_json=True, max_tokens=1400)
+        try: tables["team"] = json.loads(raw)
+        except Exception: tables["team"] = {"members":[]}
+        time.sleep(3)
 
-            tick("💰 Building Financial Analysis Table...")
-            raw = safe_ai_call(
-                messages=[
-                    {"role": "system",
-                     "content": "You output only valid JSON. No text."},
-                    {"role": "user",
-                     "content": prompt_financials_table(
-                         deck_text, company, fund_type)}
-                ],
-                expect_json=True,
-                max_tokens=1400
-            )
-            try:
-                table_data["financials"] = json.loads(raw)
-            except Exception:
-                table_data["financials"] = {"metrics": []}
-            time.sleep(3)
+        tick("💰 Unit Economics...")
+        raw = safe_ai_call([
+            {"role":"system","content":"Return only valid JSON. No text."},
+            {"role":"user","content":prompt_financials(deck,company,fund_type)}
+        ], expect_json=True, max_tokens=1600)
+        try: tables["financials"] = json.loads(raw)
+        except Exception: tables["financials"] = {"metrics":[]}
+        time.sleep(3)
 
-            tick("⚠️  Building Risk Matrix...")
-            raw = safe_ai_call(
-                messages=[
-                    {"role": "system",
-                     "content": "You output only valid JSON. No text."},
-                    {"role": "user",
-                     "content": prompt_risk_table(
-                         deck_text, company, fund_type)}
-                ],
-                expect_json=True,
-                max_tokens=1400
-            )
-            try:
-                table_data["risks"] = json.loads(raw)
-            except Exception:
-                table_data["risks"] = {"rows": []}
-            time.sleep(2)
+        tick("⚠️  Risk Matrix...")
+        raw = safe_ai_call([
+            {"role":"system","content":"Return only valid JSON. No text."},
+            {"role":"user","content":prompt_risks(deck,company,fund_type)}
+        ], expect_json=True, max_tokens=1600)
+        try: tables["risks"] = json.loads(raw)
+        except Exception: tables["risks"] = {"risks":[]}
+        time.sleep(2)
 
-            # ── Charts ────────────────────────────────────────────────────
-            tick("📈 Generating TAM/SAM/SOM Chart...")
-            tam_data = extract_tam_data(deck_text, company)
-            table_data["tam_chart"] = make_tam_chart(tam_data, company)
+        # ── Charts ────────────────────────────────────────────────────────
+        tick("📈 TAM/SAM/SOM Chart...")
+        tam_data = extract_tam(deck, company)
+        charts["tam"] = chart_tam(tam_data, company)
 
-            tick("📊 Generating Financial Assessment Chart...")
-            metrics = table_data.get("financials", {}).get("metrics", [])
-            if metrics:
-                table_data["fin_chart"] = make_financial_bar(metrics)
+        tick("📊 Unit Economics Chart...")
+        if tables["financials"].get("metrics"):
+            charts["fin"] = chart_financials(
+                tables["financials"]["metrics"])
 
-            tick("🗺️  Generating Risk Heatmap...")
-            risk_rows = table_data.get("risks", {}).get("rows", [])
-            if risk_rows:
-                table_data["risk_chart"] = make_risk_heatmap(risk_rows)
+        tick("🗺️  Risk Heatmap...")
+        if tables["risks"].get("risks"):
+            charts["risk"] = chart_risk_heatmap(
+                tables["risks"]["risks"])
 
-            # ── Done ──────────────────────────────────────────────────────
-            progress.progress(1.0)
-            status.text("✅ IC Memo Complete!")
-            st.success(f"🎉 IC Memo for **{company}** is ready!")
-            st.divider()
+        bar.progress(1.0)
+        status.text("✅ Done!")
+        st.success(f"IC Memo for **{company}** is ready!")
+        st.divider()
 
-            # ── Preview ───────────────────────────────────────────────────
-            st.subheader(f"Preview — {company} IC Memo")
+        # ── Preview ───────────────────────────────────────────────────────
+        t1, t2, t3, t4 = st.tabs([
+            "📝 Written Analysis",
+            "📊 Tables",
+            "📈 Charts",
+            "⚠️  Risk Matrix"
+        ])
 
-            tab1, tab2, tab3, tab4 = st.tabs([
-                "📝 Text Sections",
-                "📊 Tables",
-                "📈 Charts",
-                "⚠️  Risks"
-            ])
+        with t1:
+            for label, key in [
+                ("Executive Summary", "exec"),
+                ("Company Overview",  "overview"),
+                ("Market Opportunity","market"),
+                ("Recommendation",    "recommendation"),
+            ]:
+                with st.expander(f"📌 {label}", expanded=False):
+                    st.write(texts.get(key,""))
 
-            with tab1:
-                for title, key in [
-                    ("Executive Summary & Investment Thesis",
-                     "executive_summary"),
-                    ("Company Overview & Business Model",
-                     "company_overview"),
-                    ("Market Opportunity",
-                     "market_opportunity"),
-                    ("Investment Recommendation",
-                     "recommendation"),
-                ]:
-                    with st.expander(f"📌 {title}", expanded=False):
-                        st.write(text_sections.get(key, ""))
+        with t2:
+            st.markdown("**Competitive Landscape**")
+            cr = tables["competitive"].get("rows",[])
+            if cr: st.dataframe(cr, use_container_width=True)
 
-            with tab2:
-                st.markdown("**Competitive Landscape**")
-                comp_rows = table_data.get(
-                    "competitive", {}).get("rows", [])
-                if comp_rows:
-                    st.dataframe(comp_rows, use_container_width=True)
+            st.markdown("**Team Assessment**")
+            tr = tables["team"].get("members",[])
+            if tr: st.dataframe(tr, use_container_width=True)
 
-                st.markdown("**Team Assessment**")
-                team_rows = table_data.get("team", {}).get("rows", [])
-                if team_rows:
-                    st.dataframe(team_rows, use_container_width=True)
+            st.markdown("**Unit Economics**")
+            mr = tables["financials"].get("metrics",[])
+            if mr: st.dataframe(mr, use_container_width=True)
 
-                st.markdown("**Unit Economics**")
-                fin_metrics = table_data.get(
-                    "financials", {}).get("metrics", [])
-                if fin_metrics:
-                    st.dataframe(fin_metrics, use_container_width=True)
+        with t3:
+            if "tam" in charts:
+                charts["tam"].seek(0)
+                st.image(charts["tam"],
+                         caption="TAM / SAM / SOM",
+                         use_container_width=True)
+            if "fin" in charts:
+                charts["fin"].seek(0)
+                st.image(charts["fin"],
+                         caption="Unit Economics Dashboard",
+                         use_container_width=True)
 
-            with tab3:
-                if "tam_chart" in table_data:
-                    st.image(table_data["tam_chart"],
-                             caption="TAM / SAM / SOM",
-                             use_container_width=True)
-                if "fin_chart" in table_data:
-                    table_data["fin_chart"].seek(0)
-                    st.image(table_data["fin_chart"],
-                             caption="Unit Economics Assessment",
-                             use_container_width=True)
+        with t4:
+            rr = tables["risks"].get("risks",[])
+            if rr: st.dataframe(rr, use_container_width=True)
+            if "risk" in charts:
+                charts["risk"].seek(0)
+                st.image(charts["risk"],
+                         caption="Risk Heatmap",
+                         use_container_width=True)
 
-            with tab4:
-                risk_rows = table_data.get("risks", {}).get("rows", [])
-                if risk_rows:
-                    st.dataframe(risk_rows, use_container_width=True)
-                if "risk_chart" in table_data:
-                    table_data["risk_chart"].seek(0)
-                    st.image(table_data["risk_chart"],
-                             caption="Risk Heatmap",
-                             use_container_width=True)
+        st.divider()
 
-            st.divider()
+        # Reset buffers for Word doc
+        for k in ["tam","fin","risk"]:
+            if k in charts:
+                charts[k].seek(0)
 
-            # ── Download ──────────────────────────────────────────────────
-            # Reset chart buffers for Word doc
-            for key in ["tam_chart", "fin_chart", "risk_chart"]:
-                if key in table_data:
-                    table_data[key].seek(0)
+        doc_buf = build_memo(texts, tables, charts, company, fund_type)
 
-            word_file = build_word_memo(
-                text_sections, table_data, company, fund_type
-            )
-
-            st.download_button(
-                label="📥 Download Full IC Memo — Word Document",
-                data=word_file,
-                file_name=f"IC_Memo_{company.replace(' ', '_')}.docx",
-                mime=(
-                    "application/vnd.openxmlformats-officedocument"
-                    ".wordprocessingml.document"
-                ),
-                use_container_width=True
-            )
-
-            st.caption(
-                "💡 **Next step:** Review the memo, edit any sections "
-                "where you have additional context, and present to IC. "
-                "Always verify figures independently before investment decisions."
-            )
+        st.download_button(
+            label="📥 Download Full IC Memo — Word Document (.docx)",
+            data=doc_buf,
+            file_name=f"IC_Memo_{company.replace(' ','_')}.docx",
+            mime=(
+                "application/vnd.openxmlformats-officedocument"
+                ".wordprocessingml.document"
+            ),
+            use_container_width=True
+        )
+        st.caption(
+            "Review all sections before presenting to IC. "
+            "Verify all figures independently."
+        )
